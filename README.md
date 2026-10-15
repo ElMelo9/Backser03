@@ -7,15 +7,16 @@ CaronteSync es una aplicación de escritorio que copia los archivos de una carpe
 servidor a **Dropbox** o **Google Drive**. Está pensada para los respaldos `.bak`/`.trn`
 de SQL Server, incluidos archivos grandes de 15 GB o más.
 
-- **Se instala** con un instalador: `CaronteSync-1.0-instalador.exe`.
-- **Tiene una ventana** con un menú lateral de cuatro secciones:
+- **Se instala** con un instalador: `CaronteSync-1.1-instalador.exe`.
+- **Tiene una ventana** con un menú lateral de cinco secciones:
 
   | Sección | Para qué sirve |
   |---|---|
   | Estado | Porcentaje, barra de progreso, velocidad, tiempo restante, *Subir ahora* y *Detener*, registro en vivo |
-  | Configuración | Todos los parámetros |
+  | Configuración | Todos los parámetros, incluida la compresión |
   | Programación | Tarea de Windows que sube automáticamente |
-  | Historial | Ejecuciones y archivos subidos |
+  | Notificaciones | Avisos por Telegram |
+  | Historial | Ejecuciones y archivos subidos; restaurar un respaldo comprimido |
 
 - **Vive junto al reloj, como Dropbox.** Al cerrar la ventana queda un icono en el área de
   notificación (ver [Junto al reloj](#junto-al-reloj)).
@@ -46,6 +47,10 @@ CaronteSync lo instala si falta.
 - **Recuerda lo que ya subió** y en cada ejecución solo sube lo nuevo o lo modificado.
 - **Borrado local opcional**: puede borrar el archivo del disco local, pero solo después
   de verificar la copia en la nube.
+- **Compresión opcional** antes de subir, verificada antes de enviar nada (ver
+  [Compresión](#compresión)).
+- **Avisos por Telegram** opcionales al terminar cada subida (ver
+  [Avisos por Telegram](#avisos-por-telegram)).
 
 ### Qué lo hace más rápido
 
@@ -94,7 +99,7 @@ muestra la velocidad real y el tiempo restante.
 
 ## Instalación
 
-1. En un equipo moderno, obtenga `CaronteSync-1.0-instalador.exe` (vea
+1. En un equipo moderno, obtenga `CaronteSync-1.1-instalador.exe` (vea
    [Construir el instalador](#construir-el-instalador)). Cópielo al servidor con un
    pendrive o una carpeta compartida: el servidor 2003 no puede descargar desde Internet
    por HTTPS.
@@ -182,12 +187,72 @@ Alternativa: un trabajo del **Agente SQL Server**. Agregue un paso *CmdExec* que
 `crear_job_sql.sql` crea uno, y sirve para SQL Server 2000 y 2005. El paso queda en rojo
 si algún archivo no se pudo subir.
 
+## Compresión
+
+En *Configuración → Compresión*, marque **Comprimir los archivos antes de subirlos**. Cada
+archivo se sube como `nombre.bak.gz`. Los respaldos de SQL Server sin comprimir suelen
+quedar entre 3 y 6 veces más chicos, así que se ahorra espacio en la nube y tiempo de
+subida. Por cada archivo, CaronteSync:
+
+1. **Comprime** el archivo a la *carpeta temporal* (formato gzip).
+2. **Verifica la compresión** antes de subir nada: descomprime el `.gz` completo y compara
+   su SHA-256 y su tamaño con los del original. Además, gzip revisa su propio CRC-32. Si
+   algo no coincide, el archivo no se sube y queda un error en el historial.
+3. **Sube el `.gz`** y verifica la copia de la nube (igual que sin compresión).
+4. **Comprueba que el original no cambió** mientras tanto, y solo entonces borra el `.gz`
+   temporal (y el original, si está activado *borrar después de subir*).
+
+Detalles:
+
+- **Carpeta temporal.** Por defecto, `_carontesync_temporal` dentro de la carpeta de
+  origen; esa carpeta nunca se sube. Necesita espacio libre para el archivo comprimido:
+  si no alcanza, CaronteSync avisa y no sube ese archivo. Puede elegir otra carpeta,
+  por ejemplo en otro disco, pero no la carpeta de origen misma.
+- **Si se corta a mitad de la subida**, la próxima ejecución reutiliza el `.gz` ya
+  verificado y continúa la subida, sin volver a comprimir.
+- **Nivel de compresión** de 1 (rápido) a 9 (más chico). El 6 es un buen equilibrio; en
+  un servidor viejo, el 1 o el 3 comprimen bastante más rápido y ahorran casi lo mismo.
+- **No recomprime** lo que ya viene comprimido (`.gz`, `.zip`, `.7z`, `.rar`, etc.). Si
+  SQL Server ya hace los respaldos con `WITH COMPRESSION`, la compresión de CaronteSync
+  ahorra poco: déjela desactivada.
+- La barra de progreso muestra las tres fases: *Comprimiendo*, *Verificando la compresión*
+  y *Subiendo*.
+
+**Restaurar un respaldo comprimido.** Descargue el `.gz` de la nube y, en *Historial*,
+pulse **Descomprimir un .gz...**. CaronteSync restaura el archivo y comprueba el CRC-32 y
+el tamaño; si el `.gz` está dañado, lo dice y no deja un archivo a medias. También sirve
+7-Zip o cualquier programa que abra `.gz`.
+
+## Avisos por Telegram
+
+CaronteSync puede mandar un mensaje por Telegram al terminar cada subida: si salió bien
+(con la cantidad de archivos, el tamaño y el ahorro por compresión), si hubo errores o si
+la subida falló. Para configurarlo:
+
+1. En Telegram, abra una conversación con **@BotFather**, envíe `/newbot` y siga los
+   pasos. Al final le da el *token* del bot, algo como `123456789:AAH...`.
+2. Abra una conversación con su bot nuevo y envíele cualquier mensaje (por ejemplo,
+   `hola`). Si quiere recibir los avisos en un grupo, agregue el bot al grupo y escriba
+   algo en el grupo.
+3. En CaronteSync, vaya a **Notificaciones**, marque *Enviar avisos por Telegram*, pegue el
+   token y pulse **Detectar**: aparecen las conversaciones que le escribieron al bot.
+   Elija la suya y se completa el *Chat ID*.
+4. Pulse **Enviar mensaje de prueba**. Si le llega, pulse **Guardar**.
+
+Puede elegir cuándo avisar: subidas correctas, errores, y también cuando no había nada
+nuevo que subir (útil para saber que la tarea sigue corriendo). El *nombre del servidor*
+aparece en cada mensaje, para distinguirlos si tiene varios servidores.
+
+Si Telegram no responde, la subida no se ve afectada: el problema queda en el registro.
+El token no se escribe en el registro.
+
 ## Junto al reloj
 
 Al cerrar la ventana (o minimizarla), CaronteSync queda como un icono en el área de
 notificación, junto al reloj, igual que Dropbox:
 
-- **Clic** en el icono: abre la ventana.
+- **Clic o doble clic** en el icono: abre la ventana. También se abre si vuelve a
+  ejecutar CaronteSync desde el escritorio o el menú Inicio.
 - **Clic derecho**: menú con *Abrir CaronteSync*, *Subir ahora*, *Detener la subida* y
   *Salir*.
 - **Al pasar el ratón**: muestra el archivo que se está subiendo, el porcentaje y la
@@ -240,6 +305,14 @@ sesión.
   `C:\CaronteSync\carontesync.log`.
 - **Errores de red repetidos**: si la red sale por un proxy, configúrelo en
   *Configuración → Avanzado*.
+- **«No hay espacio para comprimir»**: libere espacio o elija en
+  *Configuración → Compresión* una carpeta temporal en otro disco.
+- **«La verificación de la compresión falló»**: no se subió nada de ese archivo.
+  Suele indicar un problema de disco o de memoria en el servidor; revise el disco con
+  `chkdsk`.
+- **Telegram: «no reconoce el token»**: cópielo de nuevo desde @BotFather. **«chat not
+  found»** o **«El bot todavía no recibió mensajes»**: envíele un mensaje al bot (o escriba
+  en el grupo donde lo agregó) y pulse *Detectar* otra vez.
 
 ## Archivos en C:\CaronteSync
 
@@ -253,6 +326,7 @@ sesión.
 | `estado.json` | Archivos ya subidos y subidas a medias |
 | `historial.jsonl`, `carontesync.log` | Historial y registro |
 | `actividad.json` | Avance de la ejecución en curso (lo lee la ventana) |
+| `<origen>\_carontesync_temporal` | Archivos comprimidos mientras se suben (si la compresión está activa) |
 | `cacert.pem` | Certificados raíz para HTTPS |
 | `carontesync.bat`, `crear_job_sql.sql` | Para usarlo desde el Agente SQL Server |
 

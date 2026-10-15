@@ -105,6 +105,18 @@ class PruebasVentana(unittest.TestCase):
             self.app.detener()
         self.assertTrue(os.path.exists(os.path.join(self.dir, "detener.solicitud")))
 
+    def test_la_barra_lateral_muestra_la_fase_de_compresion(self):
+        for fase, esperado in (("Comprimiendo", "Comprimiendo 40 %"),
+                               ("Verificando la compresión", "Verificando 40 %"),
+                               ("Subiendo", "Subiendo 40 %")):
+            sn.escribir_json(os.path.join(self.dir, "actividad.json"), {
+                "activo": True, "actualizado": time.time(), "inicio": time.time() - 60, "fase": fase,
+                "archivo": "base.bak", "indice": 1, "cantidad": 1, "archivo_hecho": 40, "archivo_total": 100,
+                "lote_hecho": 10, "lote_total": 100, "velocidad": 0})
+            self.app._mostrar_actividad()
+            self.assertEqual(self.app.lbl_estado.cget("text"), fase)
+            self.assertEqual(self.app.lbl_lateral.cget("text"), esperado)
+
     def test_subir_ahora_lanza_el_motor(self):
         os.makedirs(os.path.join(self.dir, "origen"))
         self.app.var("general", "origen").set(os.path.join(self.dir, "origen"))
@@ -134,7 +146,7 @@ class PruebasVentana(unittest.TestCase):
         sn.escribir_json(os.path.join(self.dir, "actividad.json"), base)
 
     def test_navegacion_lateral(self):
-        for clave in ("configuracion", "programacion", "historial", "estado"):
+        for clave in ("configuracion", "programacion", "notificaciones", "historial", "estado"):
             self.app.mostrar_pagina(clave)
             self.raiz.update()
             self.assertEqual(self.app.pagina_actual, clave)
@@ -145,6 +157,83 @@ class PruebasVentana(unittest.TestCase):
         self.app._mostrar_actividad()
         self.assertEqual(str(self.app.btn_detener.cget("state")), "disabled")
         self.assertEqual(self.app.lbl_lateral.cget("text"), "En espera")
+
+    def esperar_cola(self, condicion, segundos=10):
+        """Deja correr la ventana (y sus hilos) hasta que se cumpla la condición."""
+        fin = time.time() + segundos
+        while time.time() < fin and not condicion():
+            self.raiz.update()
+            time.sleep(0.02)
+        return condicion()
+
+    def test_opciones_de_compresion_y_telegram_se_guardan(self):
+        self.app.var("general", "origen").set(self.dir)
+        self.app.var("general", "comprimir", True).set(True)
+        self.app.var("general", "nivel_compresion").set("3")
+        self.app.var("telegram", "activo", True).set(True)
+        self.app.var("telegram", "token").set("123:abc")
+        self.app.var("telegram", "chat_id").set("987654")
+        self.app.var("telegram", "avisar_exito", True).set(False)
+        self.assertTrue(self.app.guardar(silencioso=True))
+        conf = sn.Configuracion(self.ini)
+        self.assertTrue(conf.comprimir)
+        self.assertEqual(conf.nivel_compresion, 3)
+        self.assertTrue(conf.telegram["activo"])
+        self.assertEqual(conf.telegram["chat_id"], "987654")
+        self.assertFalse(conf.telegram["avisar_exito"])
+        self.app.cargar_formulario()
+        self.assertTrue(self.app.var("general", "comprimir", True).get())
+        self.assertFalse(self.app.var("telegram", "avisar_exito", True).get())
+
+    def test_telegram_activo_sin_chat_no_se_guarda(self):
+        self.app.var("telegram", "activo", True).set(True)
+        self.app.var("telegram", "token").set("123:abc")
+        with mock.patch.object(gui.messagebox, "showerror") as error:
+            self.assertFalse(self.app.guardar(silencioso=True))
+        self.assertIn("chat ID", error.call_args[0][1])
+
+    def test_detectar_chat_y_mensaje_de_prueba(self):
+        enviados = []
+
+        class TelegramFalso(object):
+            def __init__(self, http, token, chat_id=""):
+                self.http, self.token, self.chat_id = http, token, chat_id
+
+            def chats(self):
+                return [("987654", "Ana Soporte")]
+
+            def enviar(self, texto):
+                enviados.append((self.chat_id, texto))
+
+        self.app.var("telegram", "token").set("123:abc")
+        with mock.patch.object(gui.cs, "Telegram", TelegramFalso), \
+                mock.patch.object(gui.cs, "ClienteHttp", lambda *a, **k: mock.Mock()), \
+                mock.patch.object(gui.messagebox, "showerror", side_effect=AssertionError), \
+                mock.patch.object(gui.messagebox, "showinfo") as info:
+            self.app.detectar_chat()
+            self.assertTrue(self.esperar_cola(lambda: self.app.var("telegram", "chat_id").get() == "987654"))
+            self.app.var("telegram", "nombre_servidor").set("SRV-SQL")
+            self.app.probar_telegram()
+            self.assertTrue(self.esperar_cola(lambda: enviados))
+            self.assertTrue(self.esperar_cola(lambda: info.call_count >= 2))
+        self.assertEqual(enviados[0][0], "987654")
+        self.assertIn("SRV-SQL", enviados[0][1])
+
+    def test_descomprimir_un_respaldo(self):
+        original = os.path.join(self.dir, "base.bak")
+        datos = b"respaldo de prueba " * 50000
+        with open(original, "wb") as f:
+            f.write(datos)
+        sn.comprimir_verificado(original, original + ".gz")
+        destino = os.path.join(self.dir, "restaurado.bak")
+        with mock.patch.object(gui.filedialog, "askopenfilename", return_value=original + ".gz"), \
+                mock.patch.object(gui.filedialog, "asksaveasfilename", return_value=destino), \
+                mock.patch.object(gui.messagebox, "showinfo") as info:
+            self.app.descomprimir()
+            self.assertTrue(self.esperar_cola(lambda: info.called))
+        with open(destino, "rb") as f:
+            self.assertEqual(f.read(), datos)
+        self.assertIn("comprobados", info.call_args[0][1])
 
     @unittest.skipUnless(gui.bandeja is not None if gui else False, "solo en Windows")
     def test_cerrar_deja_el_icono_junto_al_reloj(self):

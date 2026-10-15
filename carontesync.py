@@ -37,6 +37,7 @@ import configparser
 import datetime
 import fnmatch
 import getpass
+import gzip
 import hashlib
 import http.client
 import json
@@ -44,6 +45,7 @@ import logging
 import logging.handlers
 import os
 import re
+import shutil
 import socket
 import ssl
 import stat
@@ -52,8 +54,9 @@ import sys
 import threading
 import time
 import urllib.parse
+import zlib
 
-VERSION = "1.0"
+VERSION = "1.1"
 MB = 1024 * 1024
 NOMBRE_TAREA = "CaronteSync"
 TROZO_ENVIO = 256 * 1024    # cada bloque se envía en trozos para informar el avance
@@ -236,6 +239,12 @@ CAMPOS_CONFIG = (
      "No sube archivos modificados hace menos de estos minutos: SQL Server podría estar escribiéndolos."),
     ("general", "borrar_local_tras_subir", "no",
      "si = borra el archivo local después de subirlo y verificar su suma en la nube."),
+    ("general", "comprimir", "no",
+     "si = comprime cada archivo con gzip antes de subirlo y, antes de subir, comprueba que al descomprimirlo "
+     "se obtiene exactamente el original (tamaño y SHA-256)."),
+    ("general", "nivel_compresion", "6", "Nivel de compresión: 1 = más rápido, 9 = archivo más pequeño."),
+    ("general", "carpeta_temporal", "",
+     "Dónde se guarda el .gz mientras se sube. Vacío = la subcarpeta _carontesync_temporal dentro del origen."),
     ("general", "tamano_bloque_mb", "32",
      "Tamaño de cada bloque enviado (1-128 MB). Más grande = menos pausas entre bloques, pero más memoria."),
     ("general", "reintentos", "5", "Reintentos ante cortes de red o errores temporales del servicio."),
@@ -251,6 +260,13 @@ CAMPOS_CONFIG = (
     ("gdrive", "client_id", "",
      "De Google Cloud Console. El cliente OAuth debe ser del tipo 'TVs y dispositivos de entrada limitada'."),
     ("gdrive", "client_secret", "", ""),
+    ("telegram", "activo", "no", "si = envía un mensaje de Telegram al terminar cada subida."),
+    ("telegram", "token", "", "Token del bot (se obtiene de @BotFather en Telegram)."),
+    ("telegram", "chat_id", "", "A quién se envían los avisos (una persona o un grupo). La ventana puede detectarlo."),
+    ("telegram", "avisar_exito", "si", "Avisar cuando la subida termina bien."),
+    ("telegram", "avisar_errores", "si", "Avisar cuando hay errores, la subida falla o se detiene."),
+    ("telegram", "avisar_sin_novedades", "no", "Avisar también cuando no había nada nuevo que subir."),
+    ("telegram", "nombre_servidor", "", "Nombre del servidor en los avisos. Vacío = el nombre del equipo."),
     ("programacion", "activa", "no", "si = Windows ejecuta la subida automáticamente (tarea programada)."),
     ("programacion", "frecuencia", "diaria", "diaria, semanal o horas."),
     ("programacion", "hora", "03:30", "Hora de inicio (HH:MM, 24 horas)."),
@@ -354,6 +370,14 @@ class Configuracion(object):
         self.recursivo = self._booleano("general", "recursivo", False)
         self.antiguedad_minima = self._entero("general", "antiguedad_minima_minutos", 10, 0, 100000) * 60
         self.borrar_local = self._booleano("general", "borrar_local_tras_subir", False)
+        self.comprimir = self._booleano("general", "comprimir", False)
+        self.nivel_compresion = self._entero("general", "nivel_compresion", 6, 1, 9)
+        self.carpeta_temporal = self._ruta("general", "carpeta_temporal", "")
+        if not self.carpeta_temporal:
+            self.carpeta_temporal = os.path.join(self.origen or os.path.join(self.base, "temporal"),
+                                                 CARPETA_TEMPORAL)
+        if self.origen and clave_ruta(self.carpeta_temporal) == clave_ruta(self.origen):
+            raise ErrorFatal("La carpeta temporal no puede ser la misma carpeta de origen.")
         self.tamano_bloque = self._entero("general", "tamano_bloque_mb", 32, 1, 128) * MB
         self.reintentos = self._entero("general", "reintentos", 5, 0, 50)
         self.timeout = self._entero("general", "timeout_segundos", 120, 10, 3600)
@@ -376,6 +400,17 @@ class Configuracion(object):
                 "carontesync.py, o deje 'certificados' vacío para usar los del sistema."
                 .format(self.certificados))
         self.programacion = self._programacion()
+        self.telegram = {
+            "activo": self._booleano("telegram", "activo", False),
+            "token": self._texto("telegram", "token", ""),
+            "chat_id": self._texto("telegram", "chat_id", ""),
+            "avisar_exito": self._booleano("telegram", "avisar_exito", True),
+            "avisar_errores": self._booleano("telegram", "avisar_errores", True),
+            "avisar_sin_novedades": self._booleano("telegram", "avisar_sin_novedades", False),
+            "nombre_servidor": self._texto("telegram", "nombre_servidor", "") or socket.gethostname(),
+        }
+        if self.telegram["activo"] and not (self.telegram["token"] and self.telegram["chat_id"]):
+            raise ErrorFatal("Para los avisos de Telegram faltan el token del bot o el chat ID.")
 
     def _texto(self, seccion, clave, defecto):
         valor = self._ini.get(seccion, clave, fallback=defecto).strip()
@@ -625,7 +660,8 @@ class ClienteHttp(object):
             # Detenido (o Ctrl+C) a mitad de la petición: la conexión queda inservible.
             self._descartar(clave)
             raise
-        log.debug("%s %s%s -> HTTP %d", metodo, partes.hostname, partes.path, respuesta.status)
+        log.debug("%s %s%s -> HTTP %d", metodo, partes.hostname, re.sub(r"/bot[^/]+", "/bot***", partes.path),
+                  respuesta.status)
         cabeceras_respuesta = dict((k.lower(), v) for k, v in respuesta.getheaders())
         return Respuesta(respuesta.status, cabeceras_respuesta, datos)
 
@@ -832,6 +868,9 @@ class MonitorNulo(object):
     def inicio_archivo(self, relativa, tamano, indice):
         pass
 
+    def fase_archivo(self, texto, total, desde, hasta):
+        pass
+
     def fin_archivo(self):
         pass
 
@@ -853,6 +892,8 @@ class Actividad(MonitorNulo):
                       "archivo_hecho": 0, "archivo_total": 0, "lote_hecho": 0, "lote_total": 0,
                       "velocidad": 0.0, "resultado": "", "detalle": ""}
         self._terminados = 0          # bytes de los archivos ya procesados en esta ejecución
+        self._peso = 0                # tamaño original del archivo actual
+        self._tramo = (0.0, 1.0)      # parte del archivo que representa la fase actual
         self._muestras = collections.deque()
         self._siguiente_registro = 10
         self._guardado = 0.0
@@ -898,8 +939,19 @@ class Actividad(MonitorNulo):
         self._guardar(True)
 
     def inicio_archivo(self, relativa, tamano, indice):
+        self._peso = tamano
+        self._tramo = (0.0, 1.0)
         self.datos.update(archivo=relativa, archivo_total=tamano, archivo_hecho=0, indice=indice,
                           velocidad=0.0, fase="Subiendo", lote_hecho=self._terminados)
+        self._muestras.clear()
+        self._siguiente_registro = 10
+        self._guardar(True)
+
+    def fase_archivo(self, texto, total, desde, hasta):
+        """Nueva fase del archivo actual (comprimir, verificar, subir): la barra del archivo
+        vuelve a empezar y la del total avanza solo la parte (desde..hasta) de esta fase."""
+        self._tramo = (desde, hasta)
+        self.datos.update(fase=texto, archivo_total=total, archivo_hecho=0, velocidad=0.0)
         self._muestras.clear()
         self._siguiente_registro = 10
         self._guardar(True)
@@ -916,7 +968,9 @@ class Actividad(MonitorNulo):
             self.datos["velocidad"] = (hecho - self._muestras[0][1]) / transcurrido
         total = self.datos["archivo_total"]
         self.datos["archivo_hecho"] = hecho
-        self.datos["lote_hecho"] = self._terminados + hecho
+        desde, hasta = self._tramo
+        fraccion = float(hecho) / total if total else 1.0
+        self.datos["lote_hecho"] = self._terminados + int(self._peso * (desde + (hasta - desde) * fraccion))
         if total > 64 * MB:
             porcentaje = hecho * 100 // total
             if self._siguiente_registro <= porcentaje < 100:
@@ -925,7 +979,7 @@ class Actividad(MonitorNulo):
         self.latido()
 
     def fin_archivo(self):
-        self._terminados += self.datos["archivo_total"]
+        self._terminados += self._peso
         self.datos["lote_hecho"] = self._terminados
         self._guardar(True)
 
@@ -1664,6 +1718,248 @@ class Bloqueo(object):
 
 
 # ---------------------------------------------------------------------------
+# Compresión verificada
+# ---------------------------------------------------------------------------
+
+CARPETA_TEMPORAL = "_carontesync_temporal"
+EXTENSIONES_COMPRIMIDAS = (".gz", ".tgz", ".zip", ".7z", ".rar", ".bz2", ".xz", ".cab")
+LECTURA = 4 * MB
+
+
+def ya_comprimido(nombre):
+    return nombre.lower().endswith(EXTENSIONES_COMPRIMIDAS)
+
+
+def comprimir_verificado(origen, destino, nivel=6, monitor=None):
+    """Comprime 'origen' en 'destino' (gzip) y comprueba que al descomprimir 'destino' se
+    obtiene exactamente el original: mismo tamaño y misma suma SHA-256 (gzip además
+    comprueba su CRC-32). Si algo no coincide, borra el comprimido y lanza ErrorNube.
+    Devuelve {"original", "comprimido", "sha256"}."""
+    monitor = monitor or MonitorNulo()
+    info = os.stat(ruta_extendida(origen))
+    parcial = destino + ".parcial"
+    suma = hashlib.sha256()
+    leidos = 0
+    try:
+        monitor.fase_archivo("Comprimiendo", info.st_size, 0.0, 0.3)
+        with open(ruta_extendida(origen), "rb") as entrada, open(ruta_extendida(parcial), "wb") as crudo:
+            with gzip.GzipFile(filename=os.path.basename(origen), mode="wb", compresslevel=nivel, fileobj=crudo,
+                               mtime=int(info.st_mtime)) as salida:
+                while True:
+                    datos = entrada.read(LECTURA)
+                    if not datos:
+                        break
+                    suma.update(datos)
+                    salida.write(datos)
+                    leidos += len(datos)
+                    monitor.avance(leidos)
+        despues = os.stat(ruta_extendida(origen))
+        if leidos != info.st_size or despues.st_size != info.st_size or int(despues.st_mtime) != int(info.st_mtime):
+            raise ErrorNube("el archivo cambió mientras se comprimía; se volverá a intentar en la próxima ejecución")
+
+        monitor.fase_archivo("Verificando la compresión", leidos, 0.3, 0.4)
+        comprobacion = hashlib.sha256()
+        total = 0
+        try:
+            with gzip.open(ruta_extendida(parcial), "rb") as comprimido:
+                while True:
+                    datos = comprimido.read(LECTURA)
+                    if not datos:
+                        break
+                    comprobacion.update(datos)
+                    total += len(datos)
+                    monitor.avance(total)
+        except (OSError, EOFError, zlib.error) as e:
+            raise ErrorNube("la verificación de la compresión falló ({0}); no se sube".format(describir_error(e)))
+        if total != leidos or comprobacion.digest() != suma.digest():
+            raise ErrorNube("la verificación de la compresión falló: al descomprimir no se obtiene el original; "
+                            "no se sube")
+        os.replace(ruta_extendida(parcial), ruta_extendida(destino))
+        os.utime(ruta_extendida(destino), (info.st_atime, info.st_mtime))
+    except BaseException:
+        borrar_si_existe(ruta_extendida(parcial))
+        raise
+    return {"original": leidos, "comprimido": os.path.getsize(ruta_extendida(destino)), "sha256": suma.hexdigest()}
+
+
+def descomprimir(origen, destino, al_avanzar=None):
+    """Descomprime un .gz de CaronteSync (para restaurar). gzip comprueba el CRC-32 y el
+    tamaño; si el archivo está dañado lanza ErrorNube y no deja el destino a medias."""
+    parcial = destino + ".parcial"
+    total = 0
+    try:
+        with gzip.open(ruta_extendida(origen), "rb") as entrada, open(ruta_extendida(parcial), "wb") as salida:
+            while True:
+                datos = entrada.read(LECTURA)
+                if not datos:
+                    break
+                salida.write(datos)
+                total += len(datos)
+                if al_avanzar is not None:
+                    al_avanzar(total)
+        os.replace(ruta_extendida(parcial), ruta_extendida(destino))
+    except (OSError, EOFError, zlib.error) as e:
+        borrar_si_existe(ruta_extendida(parcial))
+        raise ErrorNube("No se pudo descomprimir {0}: el archivo está dañado o no es un .gz ({1})".format(
+            os.path.basename(origen), describir_error(e)))
+    except BaseException:
+        borrar_si_existe(ruta_extendida(parcial))
+        raise
+    return total
+
+
+def preparar_comprimido(conf, ruta, relativa, tamano, mtime, clave, monitor):
+    """Devuelve (ruta_del_gz, datos) con el archivo ya comprimido y verificado. Si una
+    ejecución anterior lo dejó listo (y el original no cambió), lo reutiliza: así una
+    subida de 15 GB interrumpida no obliga a comprimir de nuevo."""
+    carpeta = conf.carpeta_temporal
+    os.makedirs(ruta_extendida(carpeta), exist_ok=True)
+    nombre = "{0}_{1}.gz".format(hashlib.sha1(clave.encode("utf-8")).hexdigest()[:10],
+                                 relativa.replace("/", "_"))
+    temporal = os.path.join(carpeta, nombre)
+    ficha = temporal + ".json"
+    datos = leer_json(ruta_extendida(ficha))
+    if (datos.get("original") == tamano and datos.get("mtime") == int(mtime) and datos.get("verificado")
+            and os.path.exists(ruta_extendida(temporal))
+            and os.path.getsize(ruta_extendida(temporal)) == datos.get("comprimido")):
+        log.info("  Se usa la compresión ya verificada de %s.", relativa)
+        return temporal, datos
+    borrar_si_existe(ruta_extendida(temporal))
+    libre = shutil.disk_usage(carpeta).free
+    if libre < tamano + 50 * MB:
+        raise ErrorNube("no hay espacio para comprimir en {0}: hay {1} libres y el archivo ocupa {2}".format(
+            carpeta, legible(libre), legible(tamano)))
+    log.info("  Comprimiendo %s (nivel %d)...", relativa, conf.nivel_compresion)
+    inicio = time.time()
+    datos = comprimir_verificado(ruta, temporal, conf.nivel_compresion, monitor)
+    datos.update(clave=clave, mtime=int(mtime), verificado=True, fecha=fecha_local())
+    escribir_json(ruta_extendida(ficha), datos)
+    log.info("  Comprimido %s: %s -> %s (%d %% menos) en %s; verificado.", relativa, legible(datos["original"]),
+             legible(datos["comprimido"]), ahorro(datos), duracion(time.time() - inicio))
+    return temporal, datos
+
+
+def ahorro(datos):
+    return int(round(100.0 * (1 - float(datos["comprimido"]) / datos["original"]))) if datos["original"] else 0
+
+
+def limpiar_temporales(conf, claves_vigentes):
+    """Borra los .gz que quedaron de archivos que ya no están pendientes."""
+    carpeta = ruta_extendida(conf.carpeta_temporal)
+    if not os.path.isdir(carpeta):
+        return
+    for nombre in os.listdir(carpeta):
+        if not nombre.endswith(".gz.json"):
+            continue
+        ficha = os.path.join(carpeta, nombre)
+        if leer_json(ficha).get("clave") not in claves_vigentes:
+            borrar_si_existe(ficha[:-5])
+            borrar_si_existe(ficha)
+
+
+# ---------------------------------------------------------------------------
+# Avisos por Telegram
+# ---------------------------------------------------------------------------
+
+class Telegram(object):
+    """Envía avisos con un bot de Telegram (https://core.telegram.org/bots/api)."""
+
+    URL = "https://api.telegram.org"
+
+    def __init__(self, http, token, chat_id=""):
+        self.http = http
+        self.token = token.strip()
+        self.chat_id = "{0}".format(chat_id).strip()
+
+    def _llamar(self, metodo, campos=None):
+        url = "{0}/bot{1}/{2}".format(self.URL, self.token, metodo)
+        r = self.http.peticion("POST", url, formulario(campos or {}), CABECERA_FORMULARIO)
+        datos = r.json()
+        if r.estado == 429 or r.estado >= 500:
+            espera = (datos.get("parameters") or {}).get("retry_after")
+            raise ErrorTransitorio("Telegram respondió HTTP {0}".format(r.estado), espera=espera)
+        if r.estado != 200 or not datos.get("ok"):
+            descripcion = datos.get("description") or r.texto()
+            if r.estado in (401, 404):
+                raise ErrorFatal("Telegram no reconoce el token del bot ({0}). Cópielo de nuevo desde "
+                                 "@BotFather.".format(descripcion))
+            raise ErrorNube("Telegram no aceptó el mensaje: {0}".format(descripcion))
+        return datos.get("result")
+
+    def enviar(self, texto):
+        if not self.chat_id:
+            raise ErrorFatal("Falta el chat ID de Telegram.")
+        campos = {"chat_id": self.chat_id, "text": texto[:4000], "disable_web_page_preview": "true"}
+        return reintentar(lambda: self._llamar("sendMessage", campos), "Enviando el aviso de Telegram", 2)
+
+    def chats(self):
+        """Chats que escribieron al bot hace poco: [(chat_id, nombre)]. Sirve para averiguar
+        el chat ID: se le escribe cualquier cosa al bot y se llama a esto."""
+        encontrados = []
+        for actualizacion in reintentar(lambda: self._llamar("getUpdates"), "Consultando Telegram", 2) or []:
+            for clave in ("message", "edited_message", "channel_post", "my_chat_member"):
+                chat = (actualizacion.get(clave) or {}).get("chat")
+                if not chat:
+                    continue
+                nombre = chat.get("title") or " ".join(
+                    p for p in (chat.get("first_name"), chat.get("last_name")) if p) or chat.get("username") or ""
+                elemento = ("{0}".format(chat["id"]), nombre)
+                if elemento not in encontrados:
+                    encontrados.append(elemento)
+        return encontrados
+
+
+ICONOS_AVISO = {"correcta": u"\u2705", "con errores": u"\u26a0\ufe0f", "fallida": u"\u274c",
+                "detenida": u"\u23f8\ufe0f"}
+TITULOS_AVISO = {"correcta": "Respaldos en la nube", "con errores": "Subida con errores",
+                 "fallida": "La subida falló", "detenida": "Subida detenida"}
+
+
+def texto_aviso(conf, resultado, detalle, resumen, inicio, destino):
+    lineas = [u"{0} CaronteSync: {1}".format(ICONOS_AVISO.get(resultado, ""), TITULOS_AVISO.get(resultado, resultado)),
+              u"Servidor: {0}".format(conf.telegram["nombre_servidor"]),
+              u"Destino: {0}".format(destino),
+              u"Duración: {0}".format(duracion(time.time() - inicio)), ""]
+    for archivo in resumen.archivos[:15]:
+        if archivo["resultado"] == "subido":
+            tamano = legible(archivo["tamano"])
+            if archivo.get("subido") and archivo["subido"] != archivo["tamano"]:
+                tamano += u" \u2192 " + legible(archivo["subido"])
+            lineas.append(u"\u2022 {0} ({1}){2}".format(archivo["nombre"], tamano,
+                                                        u" verificado" if archivo.get("verificado") else ""))
+        else:
+            lineas.append(u"\u2022 {0}: {1} ({2})".format(archivo["nombre"], archivo["resultado"],
+                                                          archivo.get("detalle", "")[:200]))
+    if len(resumen.archivos) > 15:
+        lineas.append(u"\u2026 y {0} archivo(s) más".format(len(resumen.archivos) - 15))
+    if resumen.archivos:
+        lineas.append("")
+    lineas.append(detalle)
+    return u"\n".join(lineas)
+
+
+def notificar(conf, http, resultado, detalle, resumen, inicio, destino):
+    """Envía el aviso de Telegram si corresponde. Nunca hace fallar la subida."""
+    t = conf.telegram
+    if not t["activo"]:
+        return False
+    if resultado == "correcta":
+        quiere = t["avisar_exito"] if resumen.subidos or resumen.errores else t["avisar_sin_novedades"]
+    else:
+        quiere = t["avisar_errores"]
+    if not quiere:
+        return False
+    try:
+        Telegram(http, t["token"], t["chat_id"]).enviar(texto_aviso(conf, resultado, detalle, resumen, inicio,
+                                                                    destino))
+    except (ErrorFatal, ErrorNube, ErrorTransitorio, OSError) as e:
+        log.warning("No se pudo enviar el aviso de Telegram: %s", e)
+        return False
+    log.info("Aviso enviado por Telegram.")
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Sincronización
 # ---------------------------------------------------------------------------
 
@@ -1681,9 +1977,10 @@ def buscar_archivos(conf):
         log.warning("No se pudo leer la carpeta %s: %s", error.filename, error.strerror)
 
     origen = ruta_extendida(conf.origen)
+    temporal = clave_ruta(conf.carpeta_temporal)
     for raiz, carpetas, archivos in os.walk(origen, onerror=al_fallar):
         if conf.recursivo:
-            carpetas.sort()
+            carpetas[:] = sorted(c for c in carpetas if clave_ruta(os.path.join(raiz, c)) != temporal)
         else:
             del carpetas[:]
         for nombre in sorted(archivos):
@@ -1721,10 +2018,19 @@ class Resumen(object):
         self.borrados = 0
         self.errores = 0
         self.detenido = False
+        self.bytes_subidos = 0
+        self.archivos = []     # para el aviso de Telegram
+
+    def anotar(self, nombre, tamano, resultado, detalle="", subido=None, verificado=False):
+        self.archivos.append({"nombre": nombre, "tamano": tamano, "resultado": resultado, "detalle": detalle,
+                              "subido": subido, "verificado": verificado})
 
     def texto(self, simular=False):
         verbo = "se subirían" if simular else "subidos"
-        partes = ["{0} {1} ({2})".format(self.subidos, verbo, legible(self.bytes)),
+        datos = legible(self.bytes)
+        if self.bytes_subidos and self.bytes_subidos != self.bytes:
+            datos += ", {0} tras comprimir".format(legible(self.bytes_subidos))
+        partes = ["{0} {1} ({2})".format(self.subidos, verbo, datos),
                   "{0} sin cambios".format(self.sin_cambios),
                   "{0} pendientes por ser recientes".format(self.recientes),
                   "{0} con error".format(self.errores)]
@@ -1766,7 +2072,8 @@ def ejecutar_subida(conf, proveedor, simular=False, actividad=None, historial=No
                      "escribiéndose).", relativa, conf.antiguedad_minima // 60)
             resumen.recientes += 1
         elif simular:
-            log.info("[simulación] Se subiría %s (%s)", relativa, legible(info.st_size))
+            log.info("[simulación] Se subiría %s (%s)%s", relativa, legible(info.st_size),
+                     ", comprimido" if conf.comprimir and not ya_comprimido(relativa) else "")
             resumen.subidos += 1
             resumen.bytes += info.st_size
         else:
@@ -1777,34 +2084,53 @@ def ejecutar_subida(conf, proveedor, simular=False, actividad=None, historial=No
     actividad.inicio_lote(proveedor.descripcion_destino(), len(pendientes), sum(p[2] for p in pendientes))
     for indice, (ruta, relativa, tamano, mtime, clave) in enumerate(pendientes, 1):
         inicio = time.time()
+        comprimido = None
         try:
             actividad.comprobar_detener()
             actividad.inicio_archivo(relativa, tamano, indice)
             log.info("Subiendo %s (%s)...", relativa, legible(tamano))
-            reanudacion = Reanudacion(estado, clave, tamano, mtime)
-            resultado = proveedor.subir(ruta, relativa, tamano, mtime, reanudacion)
-            verificado = comprobar_subida(resultado, ruta, tamano, mtime)
+            subir_ruta, subir_relativa, subir_tamano = ruta, relativa, tamano
+            if conf.comprimir and not ya_comprimido(relativa):
+                subir_ruta, comprimido = preparar_comprimido(conf, ruta, relativa, tamano, mtime, clave, actividad)
+                subir_relativa, subir_tamano = relativa + ".gz", comprimido["comprimido"]
+                actividad.fase_archivo("Subiendo", subir_tamano, 0.4, 1.0)
+            reanudacion = Reanudacion(estado, clave, subir_tamano, mtime)
+            resultado = proveedor.subir(subir_ruta, subir_relativa, subir_tamano, mtime, reanudacion)
+            verificado = comprobar_subida(resultado, subir_ruta, subir_tamano, mtime)
+            if comprimido is not None:
+                info = os.stat(ruta)
+                if info.st_size != tamano or int(info.st_mtime) != int(mtime):
+                    raise ErrorNube("el original cambió mientras se subía; se volverá a subir en la próxima "
+                                    "ejecución")
         except Detenido:
             log.warning("Subida detenida por el usuario en %s; continuará en la próxima ejecución.", relativa)
             if historial:
                 historial.archivo(relativa, destino, tamano, time.time() - inicio, "detenido",
                                   "Continuará en la próxima ejecución.")
+            resumen.anotar(relativa, tamano, "detenido", "continuará en la próxima ejecución")
             resumen.detenido = True
             break
         except (ErrorNube, ErrorTransitorio, OSError) as e:
             log.error("No se pudo subir %s: %s", relativa, e)
             if historial:
                 historial.archivo(relativa, destino, tamano, time.time() - inicio, "error", str(e))
+            resumen.anotar(relativa, tamano, "error", str(e))
             resumen.errores += 1
             actividad.fin_archivo()
             continue
         estado.marcar(clave, tamano, mtime)
         resumen.subidos += 1
         resumen.bytes += tamano
+        resumen.bytes_subidos += subir_tamano
         segundos = max(time.time() - inicio, 0.001)
-        log.info("Subido %s en %s (%s/s)%s.", relativa, duracion(segundos), legible(int(tamano / segundos)),
-                 ", suma de verificación correcta" if verificado else "")
+        log.info("Subido %s en %s (%s/s)%s.", subir_relativa, duracion(segundos),
+                 legible(int(subir_tamano / segundos)), ", suma de verificación correcta" if verificado else "")
         detalle = "Suma de verificación correcta." if verificado else ""
+        if comprimido is not None:
+            detalle = "Comprimido de {0} a {1} ({2} % menos), compresión verificada. {3}".format(
+                legible(tamano), legible(subir_tamano), ahorro(comprimido), detalle)
+            borrar_si_existe(ruta_extendida(subir_ruta))
+            borrar_si_existe(ruta_extendida(subir_ruta + ".json"))
 
         if conf.borrar_local:
             if not verificado:
@@ -1821,9 +2147,12 @@ def ejecutar_subida(conf, proveedor, simular=False, actividad=None, historial=No
                     log.info("Borrado del disco local: %s", relativa)
         if historial:
             historial.archivo(relativa, destino, tamano, segundos, "subido", detalle.strip(), verificado)
+        resumen.anotar(subir_relativa, tamano, "subido", subido=subir_tamano, verificado=verificado)
         actividad.fin_archivo()
 
     estado.podar(destino, set(relativa for _, relativa in archivos))
+    if conf.comprimir and not resumen.detenido:
+        limpiar_temporales(conf, set(p[4] for p in pendientes if p[4] not in estado.archivos))
     return resumen
 
 
@@ -1851,6 +2180,8 @@ def subir_con_bloqueo(conf, proveedor, simular=False, origen="consola"):
         detalle = str(e) if isinstance(e, ErrorFatal) else describir_error(e)
         historial.ejecucion(inicio, origen, resumen, "fallida", detalle)
         actividad.terminar("fallida", detalle)
+        if not isinstance(e, (KeyboardInterrupt, SystemExit)):
+            notificar(conf, proveedor.http, "fallida", detalle, resumen, inicio, proveedor.descripcion_destino())
         raise
     finally:
         bloqueo.liberar()
@@ -1864,6 +2195,7 @@ def subir_con_bloqueo(conf, proveedor, simular=False, origen="consola"):
         resultado, codigo = "correcta", 0
     historial.ejecucion(inicio, origen, resumen, resultado, detalle)
     actividad.terminar(resultado, detalle)
+    notificar(conf, proveedor.http, resultado, detalle, resumen, inicio, proveedor.descripcion_destino())
     return codigo
 
 

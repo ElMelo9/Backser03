@@ -74,7 +74,8 @@ class BasePrueba(unittest.TestCase):
                 (carontesync.GoogleDrive, "URL_TOKEN", base + "/token"),
                 (carontesync.GoogleDrive, "URL_DISPOSITIVO", base + "/device/code"),
                 (carontesync.GoogleDrive, "URL_API", base + "/drive/v3"),
-                (carontesync.GoogleDrive, "URL_SUBIDA", base + "/upload/drive/v3")):
+                (carontesync.GoogleDrive, "URL_SUBIDA", base + "/upload/drive/v3"),
+                (carontesync.Telegram, "URL", base)):
             parche = mock.patch.object(clase, atributo, valor)
             parche.start()
             self.addCleanup(parche.stop)

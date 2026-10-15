@@ -76,6 +76,16 @@ def fecha_corta(texto):
         return texto or ""
 
 
+def verbo_fase(fase):
+    """Palabra corta para la fase del archivo en curso (barra lateral y bandeja)."""
+    fase = fase or ""
+    if fase.startswith("Comprimiendo"):
+        return "Comprimiendo"
+    if fase.startswith("Verificando"):
+        return "Verificando"
+    return "Subiendo"
+
+
 def leer_cola_archivo(ruta, lineas=300):
     """Últimas líneas de un archivo de texto (el registro puede ser grande)."""
     try:
@@ -161,6 +171,7 @@ class Aplicacion(object):
         self._crear_estado()
         self._crear_configuracion()
         self._crear_programacion()
+        self._crear_notificaciones()
         self._crear_historial()
 
         self.cargar_formulario()
@@ -273,8 +284,9 @@ class Aplicacion(object):
             ttk.Frame(interior, style="Tarjeta.TFrame", height=8).pack()
         return interior
 
-    def pagina(self, clave, titulo, subtitulo):
-        """Página con título, subtítulo y, a la derecha, un lugar para botones siempre visibles."""
+    def pagina(self, clave, titulo, subtitulo, desplazable=False):
+        """Página con título, subtítulo y, a la derecha, un lugar para botones siempre visibles.
+        El contenido va en marco.cuerpo; si es desplazable, tiene barra y rueda del ratón."""
         marco = ttk.Frame(self.contenido, padding=(24, 20, 24, 12))
         self.paginas[clave] = marco
         cabecera = ttk.Frame(marco)
@@ -285,6 +297,26 @@ class Aplicacion(object):
         ttk.Label(textos, text=subtitulo, style="Subtitulo.TLabel").pack(anchor="w")
         marco.acciones = ttk.Frame(cabecera)
         marco.acciones.pack(side="right", anchor="s")
+        marco.cuerpo = marco
+        if desplazable:
+            caja = ttk.Frame(marco)
+            caja.pack(fill="both", expand=True)
+            lienzo = tk.Canvas(caja, bg=C.FONDO, highlightthickness=0, borderwidth=0)
+            barra = ttk.Scrollbar(caja, orient="vertical", command=lienzo.yview)
+            lienzo.configure(yscrollcommand=barra.set)
+            barra.pack(side="right", fill="y")
+            lienzo.pack(side="left", fill="both", expand=True)
+            interior = ttk.Frame(lienzo)
+            ventana = lienzo.create_window((0, 0), window=interior, anchor="nw")
+            interior.bind("<Configure>", lambda e: lienzo.configure(scrollregion=lienzo.bbox("all")))
+            lienzo.bind("<Configure>", lambda e: lienzo.itemconfigure(ventana, width=e.width - 6))
+
+            def rueda(evento):
+                lienzo.yview_scroll(int(-evento.delta / 120) or (-1 if evento.delta > 0 else 1), "units")
+            lienzo.bind("<Enter>", lambda e: self.raiz.bind_all("<MouseWheel>", rueda))
+            lienzo.bind("<Leave>", lambda e: self.raiz.unbind_all("<MouseWheel>"))
+            marco.cuerpo = interior
+            marco.lienzo = lienzo
         return marco
 
     # ------------------------------------------------------------------
@@ -310,7 +342,8 @@ class Aplicacion(object):
 
         self.navegacion = {}
         for clave, texto in (("estado", "Estado"), ("configuracion", "Configuración"),
-                             ("programacion", "Programación"), ("historial", "Historial")):
+                             ("programacion", "Programación"), ("notificaciones", "Notificaciones"),
+                             ("historial", "Historial")):
             fila = tk.Frame(lateral, bg=C.LATERAL, cursor="hand2")
             fila.pack(fill="x")
             marca = tk.Frame(fila, bg=C.LATERAL, width=4)
@@ -377,7 +410,12 @@ class Aplicacion(object):
             return
 
         def en_tk(funcion):
-            return lambda: self.raiz.after(0, funcion)
+            # Windows llama a la bandeja desde dentro del bucle de Tk. Llamar a Tk desde ahí
+            # (por ejemplo raiz.after) deja a _tkinter sin su estado de hilo y Python aborta
+            # ("PyEval_RestoreThread: NULL tstate"): el programa se cerraba al hacer clic en el
+            # icono o al abrir el acceso directo. Solo se deja la tarea en la cola, que la
+            # ventana atiende cada 150 ms con un temporizador normal de Tk.
+            return lambda: self.cola.put(funcion)
         try:
             self.icono_bandeja = bandeja.IconoBandeja(ICONO, "CaronteSync", en_tk(self.mostrar), [
                 ("Abrir CaronteSync", en_tk(self.mostrar), None),
@@ -433,11 +471,12 @@ class Aplicacion(object):
         if en_curso:
             total = a.get("archivo_total") or 0
             porcentaje = 100.0 * (a.get("archivo_hecho") or 0) / total if total else 0
-            texto = "CaronteSync: subiendo {0} ({1:.0f} %, {2}/s)".format(
-                a.get("archivo") or "", porcentaje, cs.legible(int(a.get("velocidad") or 0)))
+            verbo = verbo_fase(a.get("fase")).lower()
+            texto = "CaronteSync: {0} {1} ({2:.0f} %, {3}/s)".format(
+                verbo, a.get("archivo") or "", porcentaje, cs.legible(int(a.get("velocidad") or 0)))
             if len(texto) > 127:
-                texto = "CaronteSync: subiendo {0:.0f} % ({1}/s)".format(
-                    porcentaje, cs.legible(int(a.get("velocidad") or 0)))
+                texto = "CaronteSync: {0} {1:.0f} % ({2}/s)".format(
+                    verbo, porcentaje, cs.legible(int(a.get("velocidad") or 0)))
         elif a.get("resultado"):
             texto = "CaronteSync: última subida {0} ({1})".format(
                 a.get("resultado"), fecha_corta(cs.fecha_local(a.get("fin"))) if a.get("fin") else "")
@@ -620,7 +659,7 @@ class Aplicacion(object):
             lote_total, lote_hecho = a.get("lote_total") or 0, a.get("lote_hecho") or 0
             self.lbl_lote.configure(text="{0} de {1}".format(cs.legible(lote_hecho), cs.legible(lote_total)))
             self.barra_lote["value"] = 1000 * lote_hecho / lote_total if lote_total else 0
-            self.lbl_lateral.configure(text="Subiendo {0:.0f} %".format(porcentaje))
+            self.lbl_lateral.configure(text="{0} {1:.0f} %".format(verbo_fase(a.get("fase")), porcentaje))
         else:
             self.lbl_archivo.configure(text="No se está subiendo nada")
             self.lbl_indice.configure(text="Use «Subir ahora» o programe la subida automática.")
@@ -757,7 +796,9 @@ class Aplicacion(object):
                                                                   padx=(0, 12))
 
     def _crear_configuracion(self):
-        marco = self.pagina("configuracion", "Configuración", "Qué subir, a dónde, y con qué cuenta.")
+        pagina = self.pagina("configuracion", "Configuración", "Qué subir, a dónde, y con qué cuenta.",
+                             desplazable=True)
+        marco = pagina.cuerpo
         que = self.tarjeta(marco, "Qué subir")
         cuadricula = ttk.Frame(que, style="Tarjeta.TFrame")
         cuadricula.pack(fill="x")
@@ -784,6 +825,27 @@ class Aplicacion(object):
         ttk.Label(espera, text="minutos: podrían estar escribiéndose. ", style="Tarjeta.TLabel").pack(side="left")
         ttk.Checkbutton(opciones, text="Borrar el archivo local después de subirlo y verificarlo en la nube",
                         variable=self.var("general", "borrar_local_tras_subir", True)).pack(anchor="w", pady=2)
+
+        compresion = self.tarjeta(marco, "Compresión", "Ahorra espacio en la nube y tiempo de subida. Antes de subir, "
+                                  "CaronteSync descomprime el .gz y comprueba que es idéntico al original (tamaño y "
+                                  "SHA-256); si no lo es, no lo sube ni borra nada.")
+        ttk.Checkbutton(compresion, text="Comprimir con gzip antes de subir (los .zip, .7z, .rar y .gz se suben "
+                                         "tal cual)", variable=self.var("general", "comprimir", True)).pack(anchor="w")
+        cuadricula = ttk.Frame(compresion, style="Tarjeta.TFrame")
+        cuadricula.pack(fill="x", pady=(6, 0))
+        cuadricula.columnconfigure(1, weight=1)
+        self._fila(cuadricula, 0, "Nivel")
+        nivel = ttk.Frame(cuadricula, style="Tarjeta.TFrame")
+        nivel.grid(row=0, column=1, columnspan=2, sticky="w")
+        Spinbox(nivel, from_=1, to=9, width=4, textvariable=self.var("general", "nivel_compresion")).pack(side="left")
+        ttk.Label(nivel, text="  1 = más rápido, 9 = archivo más pequeño (6 es un buen equilibrio)",
+                  style="Gris.TLabel").pack(side="left")
+        self._fila(cuadricula, 1, "Carpeta temporal")
+        ttk.Entry(cuadricula, textvariable=self.var("general", "carpeta_temporal")).grid(row=1, column=1, sticky="ew")
+        ttk.Button(cuadricula, text="Examinar...", command=self.elegir_temporal).grid(row=1, column=2, padx=(8, 0))
+        ttk.Label(cuadricula, text="Vacía = la subcarpeta _carontesync_temporal dentro del origen. Necesita espacio "
+                                   "para el archivo comprimido.", style="Gris.TLabel").grid(row=2, column=1,
+                                                                                            columnspan=2, sticky="w")
 
         donde = self.tarjeta(marco, "Dónde subir")
         cuadricula = ttk.Frame(donde, style="Tarjeta.TFrame")
@@ -844,7 +906,7 @@ class Aplicacion(object):
         ttk.Button(cuadricula, text="Examinar...", command=self.elegir_certificados).grid(row=1, column=2,
                                                                                           padx=(8, 0))
 
-        acciones = marco.acciones
+        acciones = pagina.acciones
         ttk.Button(acciones, text="Guardar", style="Primario.TButton", command=self.guardar).pack(side="right")
         ttk.Button(acciones, text="Descartar cambios", command=self.cargar_formulario).pack(side="right", padx=8)
         self.lbl_guardado = ttk.Label(acciones, text="", style="Subtitulo.TLabel")
@@ -879,6 +941,12 @@ class Aplicacion(object):
         if carpeta:
             self.var("general", "origen").set(os.path.normpath(carpeta))
 
+    def elegir_temporal(self):
+        carpeta = filedialog.askdirectory(parent=self.raiz, title="Carpeta temporal para comprimir",
+                                          initialdir=self.var("general", "carpeta_temporal").get() or None)
+        if carpeta:
+            self.var("general", "carpeta_temporal").set(os.path.normpath(carpeta))
+
     def elegir_certificados(self):
         ruta = filedialog.askopenfilename(parent=self.raiz, initialdir=self.base, title="Archivo de certificados",
                                           filetypes=[("Certificados", "*.pem"), ("Todos", "*.*")])
@@ -911,7 +979,8 @@ class Aplicacion(object):
         for (seccion, clave), valor in self.guardados.items():
             if seccion == "programacion" and clave in ("dias", "hora", "usuario"):
                 continue
-            booleana = clave in ("recursivo", "borrar_local_tras_subir", "activa")
+            booleana = clave in ("recursivo", "borrar_local_tras_subir", "activa", "comprimir", "activo",
+                                 "avisar_exito", "avisar_errores", "avisar_sin_novedades")
             variable = self.var(seccion, clave, booleana)
             if booleana:
                 variable.set(valor.lower() in cs.VALORES_SI)
@@ -1162,6 +1231,128 @@ class Aplicacion(object):
         self.en_hilo(lambda: cs.aplicar_programacion(conf.programacion, conf.ruta, clave), al_terminar)
 
     # ------------------------------------------------------------------
+    # Página Notificaciones (Telegram)
+    # ------------------------------------------------------------------
+
+    def _crear_notificaciones(self):
+        marco = self.pagina("notificaciones", "Notificaciones",
+                            "Reciba en Telegram un mensaje al terminar cada subida.", desplazable=True).cuerpo
+        tarjeta = self.tarjeta(marco, "Telegram")
+        ttk.Checkbutton(tarjeta, text="Enviar avisos por Telegram",
+                        variable=self.var("telegram", "activo", True)).pack(anchor="w")
+        cuadricula = ttk.Frame(tarjeta, style="Tarjeta.TFrame")
+        cuadricula.pack(fill="x", pady=(8, 0))
+        cuadricula.columnconfigure(1, weight=1)
+        self._fila(cuadricula, 0, "Token del bot")
+        ttk.Entry(cuadricula, show="*", textvariable=self.var("telegram", "token")).grid(row=0, column=1,
+                                                                                         sticky="ew")
+        self._fila(cuadricula, 1, "Chat ID")
+        ttk.Entry(cuadricula, textvariable=self.var("telegram", "chat_id")).grid(row=1, column=1, sticky="ew")
+        ttk.Button(cuadricula, text="Detectar", command=self.detectar_chat).grid(row=1, column=2, padx=(8, 0))
+        self._fila(cuadricula, 2, "Nombre del servidor")
+        ttk.Entry(cuadricula, textvariable=self.var("telegram", "nombre_servidor")).grid(row=2, column=1,
+                                                                                         sticky="ew")
+        ttk.Label(cuadricula, text="vacío = nombre del equipo", style="Gris.TLabel").grid(row=2, column=2,
+                                                                                          padx=(8, 0))
+        cuando = ttk.Frame(tarjeta, style="Tarjeta.TFrame")
+        cuando.pack(fill="x", pady=(10, 0))
+        ttk.Label(cuando, text="Avisar:", style="Negrita.TLabel").pack(anchor="w")
+        for clave, texto in (("avisar_exito", "Cuando la subida termina bien"),
+                             ("avisar_errores", "Cuando hay errores, la subida falla o se detiene"),
+                             ("avisar_sin_novedades", "También cuando no había nada nuevo que subir")):
+            ttk.Checkbutton(cuando, text=texto, variable=self.var("telegram", clave, True)).pack(anchor="w", pady=1)
+        botones = ttk.Frame(tarjeta, style="Tarjeta.TFrame")
+        botones.pack(fill="x", pady=(10, 0))
+        ttk.Button(botones, text="Enviar mensaje de prueba", style="Primario.TButton",
+                   command=self.probar_telegram).pack(side="left")
+        ttk.Button(botones, text="Guardar", command=self.guardar).pack(side="right")
+
+        ayuda = self.tarjeta(marco, "Cómo crear el bot (una sola vez)")
+        for paso in ("1. En Telegram (en el teléfono o en la PC), busque @BotFather, envíele /newbot y siga los "
+                     "pasos. Al final le da un token parecido a 123456789:AAH...",
+                     "2. Pegue ese token arriba.",
+                     "3. Abra el chat con su bot y envíele cualquier mensaje (o agréguelo a un grupo y escriba "
+                     "algo en el grupo, para que avise a todo el equipo).",
+                     "4. Pulse «Detectar»: CaronteSync encuentra el chat ID.",
+                     "5. Marque «Enviar avisos por Telegram», pulse «Enviar mensaje de prueba» y luego «Guardar»."):
+            ttk.Label(ayuda, text=paso, style="Tarjeta.TLabel", wraplength=680, justify="left").pack(anchor="w",
+                                                                                                     pady=2)
+
+    def _telegram(self):
+        """Cliente de Telegram con lo que está escrito en el formulario (aunque no esté guardado)."""
+        token = self.var("telegram", "token").get().strip()
+        if not token:
+            raise cs.ErrorFatal("Primero pegue el token del bot (se lo da @BotFather).")
+        certificados = self.var("general", "certificados").get().strip()
+        if certificados:
+            certificados = os.path.normpath(os.path.join(self.base, certificados))
+        http = cs.ClienteHttp(certificados, self.var("general", "proxy").get().strip(), 30)
+        return cs.Telegram(http, token, self.var("telegram", "chat_id").get().strip())
+
+    def detectar_chat(self):
+        try:
+            telegram = self._telegram()
+        except cs.ErrorFatal as e:
+            self.error("Telegram", e)
+            return
+
+        def trabajo():
+            try:
+                return telegram.chats()
+            finally:
+                telegram.http.cerrar()
+
+        def al_terminar(ok, chats):
+            if not ok:
+                self.error("Telegram", chats)
+            elif not chats:
+                messagebox.showinfo("Telegram", "El bot todavía no recibió mensajes.\n\nAbra el chat con su bot en "
+                                                "Telegram, envíele cualquier mensaje y vuelva a pulsar «Detectar».",
+                                    parent=self.raiz)
+            elif len(chats) == 1:
+                self.var("telegram", "chat_id").set(chats[0][0])
+                messagebox.showinfo("Telegram", "Chat encontrado: {0} ({1}).".format(chats[0][1], chats[0][0]),
+                                    parent=self.raiz)
+            else:
+                ElegirChat(self, chats)
+        self.en_hilo(trabajo, al_terminar)
+
+    def probar_telegram(self):
+        try:
+            telegram = self._telegram()
+            if not telegram.chat_id:
+                raise cs.ErrorFatal("Falta el chat ID: pulse «Detectar».")
+        except cs.ErrorFatal as e:
+            self.error("Telegram", e)
+            return
+        servidor = self.var("telegram", "nombre_servidor").get().strip() or __import__("socket").gethostname()
+
+        def trabajo():
+            try:
+                telegram.enviar(u"\U0001f514 Prueba de CaronteSync desde {0}: los avisos funcionan.".format(servidor))
+            finally:
+                telegram.http.cerrar()
+
+        def al_terminar(ok, resultado):
+            if ok:
+                messagebox.showinfo("Telegram", "Mensaje enviado. Revise Telegram.", parent=self.raiz)
+            else:
+                self.error("Telegram", resultado)
+        self.en_hilo(trabajo, al_terminar)
+
+    def descomprimir(self):
+        origen = filedialog.askopenfilename(parent=self.raiz, title="Respaldo comprimido (.gz) a restaurar",
+                                            filetypes=[("Respaldos comprimidos", "*.gz"), ("Todos", "*.*")])
+        if not origen:
+            return
+        sugerido = os.path.basename(origen)[:-3] if origen.lower().endswith(".gz") else os.path.basename(origen) + \
+            ".descomprimido"
+        destino = filedialog.asksaveasfilename(parent=self.raiz, title="Guardar el respaldo descomprimido como",
+                                               initialdir=os.path.dirname(origen), initialfile=sugerido)
+        if destino:
+            DialogoDescompresion(self, origen, os.path.normpath(destino))
+
+    # ------------------------------------------------------------------
     # Página Historial
     # ------------------------------------------------------------------
 
@@ -1179,6 +1370,8 @@ class Aplicacion(object):
             ("detalle", "Detalle", 200)))
         ttk.Button(marco.acciones, text="Actualizar", command=lambda: self.cargar_historial(True)).pack(
             side="right")
+        ttk.Button(marco.acciones, text="Descomprimir un .gz...", command=self.descomprimir).pack(side="right",
+                                                                                                  padx=8)
         ttk.Label(marco.acciones, text="Doble clic en una fila: detalle completo", style="Subtitulo.TLabel").pack(
             side="right", padx=10)
 
@@ -1284,6 +1477,62 @@ class VentanaTexto(Dialogo):
         caja.configure(state="disabled")
         caja.pack(fill="both", expand=True)
         ttk.Button(self.cuerpo, text="Cerrar", command=self.destroy).pack(anchor="e", pady=(12, 0))
+
+
+class ElegirChat(Dialogo):
+    def __init__(self, app, chats):
+        Dialogo.__init__(self, app.raiz, "Elegir el chat de Telegram")
+        self.app = app
+        self.chats = chats
+        ttk.Label(self.cuerpo, text="El bot recibió mensajes de varios chats. ¿A cuál se envían los avisos?",
+                  style="Tarjeta.TLabel").pack(anchor="w")
+        self.lista = tk.Listbox(self.cuerpo, height=min(8, len(chats)), width=50, relief="flat",
+                                highlightthickness=1, highlightbackground=C.BORDE)
+        for chat_id, nombre in chats:
+            self.lista.insert("end", u"{0}  ({1})".format(nombre or "sin nombre", chat_id))
+        self.lista.selection_set(0)
+        self.lista.pack(fill="x", pady=10)
+        ttk.Button(self.cuerpo, text="Usar este chat", style="Primario.TButton", command=self.elegir).pack(anchor="e")
+        self.grab_set()
+
+    def elegir(self):
+        seleccion = self.lista.curselection()
+        if seleccion:
+            self.app.var("telegram", "chat_id").set(self.chats[seleccion[0]][0])
+        self.destroy()
+
+
+class DialogoDescompresion(Dialogo):
+    """Descomprime un .gz para restaurarlo; gzip comprueba el CRC-32 y el tamaño."""
+
+    def __init__(self, app, origen, destino):
+        Dialogo.__init__(self, app.raiz, "Descomprimir respaldo")
+        self.app = app
+        self.resizable(False, False)
+        ttk.Label(self.cuerpo, text=u"{0}\n\u2192 {1}".format(origen, destino), style="Tarjeta.TLabel",
+                  wraplength=520, justify="left").pack(anchor="w")
+        self.barra = ttk.Progressbar(self.cuerpo, mode="indeterminate", length=520,
+                                     style="Ocupado.Horizontal.TProgressbar")
+        self.barra.pack(pady=12)
+        self.barra.start(15)
+        self.lbl = ttk.Label(self.cuerpo, text="Descomprimiendo...", style="Gris.TLabel")
+        self.lbl.pack(anchor="w")
+        self.protocol("WM_DELETE_WINDOW", lambda: None)    # espera a que termine
+        self.grab_set()
+
+        def avance(total):
+            app.cola.put(lambda: self.winfo_exists() and self.lbl.configure(
+                text="{0} descomprimidos...".format(cs.legible(total))))
+
+        def al_terminar(ok, resultado):
+            self.destroy()
+            if ok:
+                messagebox.showinfo("Descomprimir", "Listo: {0} restaurados y comprobados (CRC-32 y tamaño "
+                                                    "correctos).\n\n{1}".format(cs.legible(resultado), destino),
+                                    parent=app.raiz)
+            else:
+                app.error("Descomprimir", resultado)
+        app.en_hilo(lambda: cs.descomprimir(origen, destino, avance), al_terminar)
 
 
 class DialogoDropbox(Dialogo):

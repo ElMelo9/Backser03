@@ -1,5 +1,5 @@
 @echo off
-rem Construye instalador\salida\CaronteSync-1.0-instalador.exe en un equipo con
+rem Construye instalador\salida\CaronteSync-1.1-instalador.exe en un equipo con
 rem Windows 7 o posterior (no en el servidor 2003: este no puede descargar por HTTPS).
 rem Requiere Inno Setup 5.6.1: https://files.jrsoftware.org/is/5/innosetup-5.6.1-unicode.exe
 

@@ -41,6 +41,9 @@ class NubeFalsa(object):
         self.peticiones = []          # (metodo, ruta)
         self.fallos = []              # dicts: metodo, ruta (prefijo), estado, veces, despues
         self.al_recibir = None        # función (metodo, ruta) llamada al recibir cada petición
+        # Telegram
+        self.tg_token = "123456:TOKEN-DE-PRUEBA"
+        self.tg_mensajes = []         # (chat_id, texto)
         self.token_valido = None
         self.tokens_emitidos = 0
         # Dropbox
@@ -128,11 +131,34 @@ class NubeFalsa(object):
             return self._dbx_token(urllib.parse.parse_qs(cuerpo.decode("ascii")))
         if ruta in ("/token", "/device/code"):
             return self._gd_oauth(ruta, urllib.parse.parse_qs(cuerpo.decode("ascii")))
+        if ruta.startswith("/bot"):
+            return self._telegram(ruta, urllib.parse.parse_qs(cuerpo.decode("ascii")))
         if not self._autorizado(h) and not ruta.startswith("/upload/sesion/"):
             return 401, {"error_summary": "expired_access_token/", "error": {"code": 401}}, None
         if ruta.startswith("/2/"):
             return self._dropbox(h, ruta[3:], cuerpo)
         return self._drive(h, ruta, consulta, cuerpo)
+
+    # -- Telegram ---------------------------------------------------------
+
+    def _telegram(self, ruta, campos):
+        token, metodo = ruta[4:].split("/", 1)
+        if token != self.tg_token:
+            return 401, {"ok": False, "error_code": 401, "description": "Unauthorized"}, None
+        if metodo == "sendMessage":
+            if campos.get("chat_id") != ["987654"]:
+                return 400, {"ok": False, "error_code": 400, "description": "Bad Request: chat not found"}, None
+            self.tg_mensajes.append((campos["chat_id"][0], campos["text"][0]))
+            return 200, {"ok": True, "result": {"message_id": len(self.tg_mensajes)}}, None
+        if metodo == "getUpdates":
+            return 200, {"ok": True, "result": [
+                {"update_id": 1, "message": {"chat": {"id": 987654, "type": "private", "first_name": "Ana",
+                                                      "last_name": "Soporte"}, "text": "hola"}},
+                {"update_id": 2, "message": {"chat": {"id": -100222, "type": "group", "title": "Sistemas"},
+                                             "text": "/start"}},
+                {"update_id": 3, "message": {"chat": {"id": 987654, "type": "private", "first_name": "Ana",
+                                                      "last_name": "Soporte"}, "text": "otra vez"}}]}, None
+        return 404, {"ok": False, "error_code": 404, "description": "Not Found"}, None
 
     # -- Dropbox ----------------------------------------------------------
 

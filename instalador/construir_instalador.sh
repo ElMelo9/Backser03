@@ -1,5 +1,5 @@
 #!/bin/sh
-# Construye instalador/salida/CaronteSync-1.0-instalador.exe en Linux con Wine.
+# Construye instalador/salida/CaronteSync-1.1-instalador.exe en Linux con Wine.
 # Requiere Wine (con soporte de 32 bits) e Inno Setup 5.6.1 instalado en Wine en
 # C:\InnoSetup5 (wine innosetup-5.6.1-unicode.exe /VERYSILENT /DIR="C:\InnoSetup5").
 set -e

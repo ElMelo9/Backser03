@@ -126,6 +126,7 @@ class PruebasSistemaWindows(unittest.TestCase):
         finally:
             otro.kill()
             otro.wait()
+            otro.stdout.close()
         bloqueo = carontesync.Bloqueo(ruta)     # Windows lo libera al morir el proceso
         self.assertTrue(bloqueo.adquirir())
         bloqueo.liberar()
@@ -228,6 +229,57 @@ class PruebasBandeja(unittest.TestCase):
             ctypes.windll.user32.PostMessageW(self.icono.hwnd, mensaje, 0, 0)
             self.bombear()
         self.assertEqual(notificar.call_args[0][0], self.b.NIM_ADD)
+
+
+GUION_BANDEJA = r"""
+import ctypes, importlib.machinery, os, sys, tempfile, time, tkinter
+raiz_proyecto = sys.argv[1]
+gui = importlib.machinery.SourceFileLoader(
+    "gui", os.path.join(raiz_proyecto, "carontesync_gui.pyw")).load_module()
+raiz = tkinter.Tk()
+app = gui.Aplicacion(raiz, os.path.join(tempfile.mkdtemp(), "carontesync.ini"), en_bandeja=True)
+raiz.update()
+print("antes:", raiz.state())
+if sys.argv[2] == "clic":
+    for evento in (0x0201, 0x0202, 0x0203, 0x0202):    # doble clic: abajo, arriba, doble, arriba
+        ctypes.windll.user32.PostMessageW(app.icono_bandeja.hwnd, gui.bandeja.WM_BANDEJA, 1, evento)
+else:
+    gui.bandeja.mostrar_instancia_abierta()           # lo que hace el acceso directo del escritorio
+fin = time.time() + 3
+while time.time() < fin:
+    raiz.update()                                      # el bucle real de Tk despacha los mensajes
+    time.sleep(0.05)
+print("despues:", raiz.state())
+app.salir()
+"""
+
+
+@unittest.skipUnless(EN_WINDOWS, "solo en Windows")
+class PruebasBandejaConTk(unittest.TestCase):
+    """Regresión: con la ventana oculta junto al reloj, el doble clic en el icono o el acceso
+    directo del escritorio cerraban el programa ("PyEval_RestoreThread: NULL tstate")."""
+
+    def ejecutar(self, caso):
+        guion = os.path.join(tempfile.mkdtemp(prefix="carontesync_bandeja_"), "guion.py")
+        with open(guion, "w", encoding="utf-8") as f:
+            f.write(GUION_BANDEJA)
+        proceso = subprocess.Popen([sys.executable, "-X", "faulthandler", guion, RAIZ, caso],
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        try:
+            salida = proceso.communicate(timeout=60)[0].decode("utf-8", "replace")
+        except subprocess.TimeoutExpired:
+            proceso.kill()     # si Python aborta, Windows puede dejar abierto un diálogo de error
+            salida = proceso.communicate()[0].decode("utf-8", "replace")
+            self.fail("la ventana se colgó o se cerró al mostrarse desde la bandeja:\n" + salida)
+        self.assertEqual(proceso.returncode, 0, salida)
+        self.assertIn("antes: withdrawn", salida)
+        self.assertIn("despues: normal", salida)
+
+    def test_doble_clic_en_el_icono_muestra_la_ventana(self):
+        self.ejecutar("clic")
+
+    def test_acceso_directo_del_escritorio_muestra_la_ventana(self):
+        self.ejecutar("escritorio")
 
 
 class PruebasRed(BasePrueba):
