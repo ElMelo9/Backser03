@@ -7,7 +7,7 @@
 ; Los scripts construir_instalador.bat (Windows) y construir_instalador.sh (Linux con
 ; Wine) los descargan y compilan este archivo.
 
-#define Version "3.0"
+#define Version "1.0"
 
 [Setup]
 AppId={{9B3C7E21-5F4A-4D8E-A1C6-3E7B2D9F0C54}

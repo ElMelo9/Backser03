@@ -7,7 +7,7 @@ CaronteSync es una aplicación de escritorio que copia los archivos de una carpe
 servidor a **Dropbox** o **Google Drive**. Está pensada para los respaldos `.bak`/`.trn`
 de SQL Server, incluidos archivos grandes de 15 GB o más.
 
-- **Se instala** con un instalador: `CaronteSync-3.0-instalador.exe`.
+- **Se instala** con un instalador: `CaronteSync-1.0-instalador.exe`.
 - **Tiene una ventana** con un menú lateral de cuatro secciones:
 
   | Sección | Para qué sirve |
@@ -94,7 +94,7 @@ muestra la velocidad real y el tiempo restante.
 
 ## Instalación
 
-1. En un equipo moderno, obtenga `CaronteSync-3.0-instalador.exe` (vea
+1. En un equipo moderno, obtenga `CaronteSync-1.0-instalador.exe` (vea
    [Construir el instalador](#construir-el-instalador)). Cópielo al servidor con un
    pendrive o una carpeta compartida: el servidor 2003 no puede descargar desde Internet
    por HTTPS.

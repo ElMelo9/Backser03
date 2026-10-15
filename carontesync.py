@@ -53,7 +53,7 @@ import threading
 import time
 import urllib.parse
 
-VERSION = "3.0"
+VERSION = "1.0"
 MB = 1024 * 1024
 NOMBRE_TAREA = "CaronteSync"
 TROZO_ENVIO = 256 * 1024    # cada bloque se envía en trozos para informar el avance
