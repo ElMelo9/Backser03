@@ -1,0 +1,6 @@
+# Windows Server 2003: el Bloc de notas y cmd.exe necesitan fin de línea CRLF.
+*.bat text eol=crlf
+*.ini text eol=crlf
+*.sql text eol=crlf
+*.py  text eol=crlf
+*.md  text eol=crlf

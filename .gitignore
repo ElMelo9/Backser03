@@ -1,0 +1,12 @@
+# Configuración y datos locales de cada servidor (contienen credenciales)
+subir_nube.ini
+tokens.json
+estado.json
+*.tmp
+*.lock
+*.log
+*.log.*
+cacert.pem
+
+__pycache__/
+*.pyc
