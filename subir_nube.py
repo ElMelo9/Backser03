@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-subir_nube.py - Copia los archivos de una carpeta local a una carpeta en
-Dropbox o Google Drive.
+subir_nube.py - Motor de SubirNube: copia los archivos de una carpeta local a
+una carpeta en Dropbox o Google Drive.
 
 Pensado para Windows Server 2003 (por ejemplo, un servidor con SQL Server
 2000/2005 que deja sus respaldos .bak en disco). Windows 2003 no habla
@@ -10,11 +10,12 @@ ejecuta con Python 3.4.4 (la última versión con instalador para XP/2003),
 que trae su propio OpenSSL. Solo usa la librería estándar de Python y
 funciona igual con cualquier Python 3 más moderno.
 
-Uso:
+La ventana (subir_nube_gui.pyw) usa este módulo; también se puede usar solo:
     python subir_nube.py autorizar        Vincula la cuenta de Dropbox o Google Drive.
     python subir_nube.py probar           Comprueba la conexión y muestra la cuenta.
     python subir_nube.py subir            Sube los archivos nuevos o modificados.
     python subir_nube.py subir --simular  Muestra qué se subiría, sin subir nada.
+    python subir_nube.py programar        Crea o quita la tarea programada de Windows.
 
 Opciones:
     -c / --config RUTA   Archivo de configuración (por defecto, subir_nube.ini
@@ -22,14 +23,17 @@ Opciones:
     -v / --detallado     Registra también los mensajes de depuración.
 
 Códigos de salida: 0 = todo bien, 1 = algún archivo no se pudo subir,
-2 = error de configuración, autorización o certificados, 3 = error inesperado.
+2 = error de configuración, autorización o certificados, 3 = error inesperado,
+4 = el usuario detuvo la subida (continuará en la próxima ejecución).
 """
 
 import argparse
 import base64
+import collections
 import configparser
 import datetime
 import fnmatch
+import getpass
 import hashlib
 import http.client
 import json
@@ -38,12 +42,15 @@ import logging.handlers
 import os
 import re
 import ssl
+import subprocess
 import sys
 import time
 import urllib.parse
 
-VERSION = "1.0"
+VERSION = "2.0"
 MB = 1024 * 1024
+NOMBRE_TAREA = "SubirNube"
+TROZO_ENVIO = 256 * 1024    # cada bloque se envía en trozos para informar el avance
 
 log = logging.getLogger("subir_nube")
 
@@ -69,6 +76,10 @@ class ErrorTransitorio(Exception):
     def __init__(self, mensaje, espera=None):
         Exception.__init__(self, mensaje)
         self.espera = espera
+
+
+class Detenido(Exception):
+    """El usuario pidió detener la subida; continuará en la próxima ejecución."""
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +112,10 @@ def fecha_iso(marca):
     return fecha.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def fecha_local(marca=None):
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(marca))
+
+
 def formulario(campos):
     return urllib.parse.urlencode(campos).encode("ascii")
 
@@ -127,12 +142,76 @@ def describir_error(e):
     return "{0}: {1}".format(type(e).__name__, texto) if texto else type(e).__name__
 
 
+def borrar_si_existe(ruta):
+    try:
+        os.remove(ruta)
+    except OSError:
+        pass
+
+
+def escribir_json(ruta, datos):
+    """Escribe en un temporal y lo renombra, para no dejar el archivo a medias."""
+    temporal = ruta + ".tmp"
+    with open(temporal, "w", encoding="utf-8") as f:
+        json.dump(datos, f, indent=1, sort_keys=True, ensure_ascii=False)
+    os.replace(temporal, ruta)
+
+
+def leer_json(ruta):
+    """Contenido de un archivo JSON, o {} si no existe o no se puede leer."""
+    try:
+        with open(ruta, "r", encoding="utf-8") as f:
+            datos = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return datos if isinstance(datos, dict) else {}
+
+
 # ---------------------------------------------------------------------------
 # Configuración
 # ---------------------------------------------------------------------------
 
 VALORES_SI = ("1", "si", "sí", "s", "yes", "y", "true", "verdadero", "on")
 VALORES_NO = ("0", "no", "n", "false", "falso", "off", "")
+
+# Días para la tarea programada: (abreviatura en español, la que usa schtasks, nombre).
+DIAS_SEMANA = (("LUN", "MON", "lunes"), ("MAR", "TUE", "martes"), ("MIE", "WED", "miércoles"),
+               ("JUE", "THU", "jueves"), ("VIE", "FRI", "viernes"), ("SAB", "SAT", "sábados"),
+               ("DOM", "SUN", "domingos"))
+
+# Todos los parámetros del .ini: (sección, clave, valor por defecto, comentario).
+CAMPOS_CONFIG = (
+    ("general", "proveedor", "dropbox", "Servicio de destino: dropbox o gdrive (Google Drive)."),
+    ("general", "origen", "", "Carpeta local con los archivos a subir (por ejemplo, los respaldos de SQL Server)."),
+    ("general", "carpeta_remota", "/Respaldos/SQL", "Carpeta de destino en la nube. Se crea si no existe."),
+    ("general", "patrones", "*.bak;*.trn", "Qué archivos subir, separados por ';'. Ejemplos: *.bak;*.trn  *.zip  *"),
+    ("general", "recursivo", "no", "si = incluye las subcarpetas del origen y las recrea en la nube."),
+    ("general", "antiguedad_minima_minutos", "10",
+     "No sube archivos modificados hace menos de estos minutos: SQL Server podría estar escribiéndolos."),
+    ("general", "borrar_local_tras_subir", "no",
+     "si = borra el archivo local después de subirlo y verificar su suma en la nube."),
+    ("general", "tamano_bloque_mb", "16", "Tamaño de cada bloque enviado (1-128 MB)."),
+    ("general", "reintentos", "5", "Reintentos ante cortes de red o errores temporales del servicio."),
+    ("general", "timeout_segundos", "120", "Tiempo máximo de espera de cada petición."),
+    ("general", "certificados", "cacert.pem",
+     "Certificados raíz para HTTPS (los de Windows 2003 están desactualizados). Vacío = los de Windows."),
+    ("general", "proxy", "", "Proxy de salida, si hace falta: host:puerto  o  http://usuario:clave@host:puerto"),
+    ("general", "archivo_log", "subir_nube.log", ""),
+    ("general", "archivo_estado", "estado.json", ""),
+    ("general", "archivo_tokens", "tokens.json", "Aquí se guarda el permiso de acceso a la cuenta: protéjalo."),
+    ("dropbox", "app_key", "", "De https://www.dropbox.com/developers/apps (pestaña Settings de su app)."),
+    ("dropbox", "app_secret", "", ""),
+    ("gdrive", "client_id", "",
+     "De Google Cloud Console. El cliente OAuth debe ser del tipo 'TVs y dispositivos de entrada limitada'."),
+    ("gdrive", "client_secret", "", ""),
+    ("programacion", "activa", "no", "si = Windows ejecuta la subida automáticamente (tarea programada)."),
+    ("programacion", "frecuencia", "diaria", "diaria, semanal o horas."),
+    ("programacion", "hora", "03:30", "Hora de inicio (HH:MM, 24 horas)."),
+    ("programacion", "dias", "LUN,MAR,MIE,JUE,VIE", "Para la frecuencia semanal: LUN,MAR,MIE,JUE,VIE,SAB,DOM"),
+    ("programacion", "cada_horas", "4", "Para la frecuencia 'horas': cada cuántas horas."),
+    ("programacion", "usuario", "",
+     "Cuenta que ejecuta la tarea. Vacío = SYSTEM (no necesita contraseña ni que haya alguien conectado)."),
+)
 
 
 def leer_texto(ruta):
@@ -145,6 +224,56 @@ def leer_texto(ruta):
         return crudo.decode("cp1252", "replace")
 
 
+def leer_valores(ruta):
+    """Valores del .ini como textos {(sección, clave): valor}, con los valores por
+    defecto donde falten. No valida nada: la ventana lo usa para llenar el formulario."""
+    valores = dict(((s, c), d) for s, c, d, _ in CAMPOS_CONFIG)
+    if os.path.isfile(ruta):
+        ini = configparser.ConfigParser(interpolation=None)
+        try:
+            ini.read_string(leer_texto(ruta), source=ruta)
+        except (configparser.Error, OSError):
+            return valores
+        for seccion, clave, _, _ in CAMPOS_CONFIG:
+            if ini.has_option(seccion, clave):
+                valores[(seccion, clave)] = ini.get(seccion, clave).strip()
+    return valores
+
+
+def texto_configuracion(valores):
+    """Contenido completo del .ini, con un comentario para cada parámetro."""
+    lineas = ["; Configuración de SubirNube. Se edita desde la ventana del programa,",
+              "; o a mano con el Bloc de notas (los comentarios van en su propia línea)."]
+    seccion_actual = None
+    for seccion, clave, defecto, comentario in CAMPOS_CONFIG:
+        if seccion != seccion_actual:
+            lineas.extend(["", "[{0}]".format(seccion)])
+            seccion_actual = seccion
+        valor = "{0}".format(valores.get((seccion, clave), defecto)).strip()
+        if "\n" in valor or "\r" in valor:
+            raise ErrorFatal("El valor de '{0}' no puede tener saltos de línea.".format(clave))
+        if comentario:
+            lineas.append("; " + comentario)
+        lineas.append("{0} = {1}".format(clave, valor))
+    return "\n".join(lineas) + "\n"
+
+
+def guardar_configuracion(ruta, valores):
+    """Escribe el .ini completo, comprueba que sea válido y solo entonces reemplaza
+    el anterior. Devuelve la Configuracion; lanza ErrorFatal si no es válida."""
+    texto = texto_configuracion(valores)
+    temporal = ruta + ".nuevo"
+    with open(temporal, "w", encoding="utf-8-sig", newline="\r\n") as f:
+        f.write(texto)
+    try:
+        Configuracion(temporal)
+    except ErrorFatal:
+        borrar_si_existe(temporal)
+        raise
+    os.replace(temporal, ruta)
+    return Configuracion(ruta)
+
+
 class Configuracion(object):
     """Lee subir_nube.ini. Las rutas relativas se toman desde la carpeta del .ini,
     porque el Programador de tareas y el Agente SQL arrancan en otra carpeta."""
@@ -152,9 +281,8 @@ class Configuracion(object):
     def __init__(self, ruta):
         self.ruta = os.path.abspath(ruta)
         if not os.path.isfile(self.ruta):
-            raise ErrorFatal(
-                "No existe el archivo de configuración {0}. Copie subir_nube.ejemplo.ini "
-                "como subir_nube.ini y edítelo.".format(self.ruta))
+            raise ErrorFatal("No existe el archivo de configuración {0}. Configure el programa desde su "
+                             "ventana o copie subir_nube.ejemplo.ini como subir_nube.ini.".format(self.ruta))
         self.base = os.path.dirname(self.ruta)
         self._ini = configparser.ConfigParser(interpolation=None)
         try:
@@ -176,7 +304,7 @@ class Configuracion(object):
         self.recursivo = self._booleano("general", "recursivo", False)
         self.antiguedad_minima = self._entero("general", "antiguedad_minima_minutos", 10, 0, 100000) * 60
         self.borrar_local = self._booleano("general", "borrar_local_tras_subir", False)
-        self.tamano_bloque = self._entero("general", "tamano_bloque_mb", 8, 1, 128) * MB
+        self.tamano_bloque = self._entero("general", "tamano_bloque_mb", 16, 1, 128) * MB
         self.reintentos = self._entero("general", "reintentos", 5, 0, 50)
         self.timeout = self._entero("general", "timeout_segundos", 120, 10, 3600)
         self.certificados = self._ruta("general", "certificados", "cacert.pem")
@@ -184,13 +312,20 @@ class Configuracion(object):
         self.archivo_log = self._ruta("general", "archivo_log", "subir_nube.log")
         self.archivo_estado = self._ruta("general", "archivo_estado", "estado.json")
         self.archivo_tokens = self._ruta("general", "archivo_tokens", "tokens.json")
+        # Archivos que comparten el motor y la ventana.
+        self.archivo_historial = os.path.join(self.base, "historial.jsonl")
+        self.archivo_actividad = os.path.join(self.base, "actividad.json")
+        self.archivo_detener = os.path.join(self.base, "detener.solicitud")
 
+        if self.proxy:
+            analizar_proxy(self.proxy)
         if self.certificados and not os.path.isfile(self.certificados):
             raise ErrorFatal(
                 "No se encuentra el archivo de certificados {0}. Descárguelo desde "
                 "https://curl.se/ca/cacert.pem (en un equipo moderno) y cópielo junto a "
                 "subir_nube.py, o deje 'certificados' vacío para usar los del sistema."
                 .format(self.certificados))
+        self.programacion = self._programacion()
 
     def _texto(self, seccion, clave, defecto):
         valor = self._ini.get(seccion, clave, fallback=defecto).strip()
@@ -222,16 +357,42 @@ class Configuracion(object):
             raise ErrorFatal("'{0}' en [{1}] debe estar entre {2} y {3}.".format(clave, seccion, minimo, maximo))
         return numero
 
+    def _programacion(self):
+        frecuencia = self._texto("programacion", "frecuencia", "diaria").lower()
+        if frecuencia not in ("diaria", "semanal", "horas"):
+            raise ErrorFatal("'frecuencia' en [programacion] debe ser diaria, semanal u horas.")
+        hora = self._texto("programacion", "hora", "03:30")
+        m = re.match(r"^(\d{1,2}):(\d{2})$", hora)
+        if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+            raise ErrorFatal("'hora' en [programacion] debe tener el formato HH:MM (se leyó '{0}').".format(hora))
+        validos = [d[0] for d in DIAS_SEMANA]
+        dias = [d.strip().upper() for d in re.split("[;, ]+", self._texto("programacion", "dias", "")) if d.strip()]
+        dias = [d.replace("MIÉ", "MIE").replace("SÁB", "SAB") for d in dias]
+        for dia in dias:
+            if dia not in validos:
+                raise ErrorFatal("Día desconocido '{0}' en [programacion]. Use {1}.".format(dia, ",".join(validos)))
+        programacion = Programacion(
+            activa=self._booleano("programacion", "activa", False), frecuencia=frecuencia,
+            hora="{0:02d}:{1}".format(int(m.group(1)), m.group(2)),
+            dias=[d for d in validos if d in dias],
+            cada_horas=self._entero("programacion", "cada_horas", 4, 1, 23),
+            usuario=self._texto("programacion", "usuario", ""))
+        if programacion.activa and frecuencia == "semanal" and not programacion.dias:
+            raise ErrorFatal("Elija al menos un día de la semana para la subida automática.")
+        return programacion
+
     def credencial(self, seccion, clave):
         valor = self._texto(seccion, clave, "")
         if not valor:
-            raise ErrorFatal("Falta '{0}' en la sección [{1}] de {2}.".format(clave, seccion, self.ruta))
+            raise ErrorFatal("Falta '{0}' en la sección [{1}] de la configuración.".format(clave, seccion))
         return valor
 
     def archivos_propios(self):
         """Archivos del propio programa que nunca deben subirse aunque estén en el origen."""
         rutas = [self.ruta, self.certificados, self.archivo_tokens, self.archivo_tokens + ".tmp",
-                 self.archivo_estado, self.archivo_estado + ".tmp", self.archivo_estado + ".lock"]
+                 self.archivo_estado, self.archivo_estado + ".tmp", self.archivo_estado + ".lock",
+                 self.archivo_historial, self.archivo_actividad, self.archivo_actividad + ".tmp",
+                 self.archivo_detener]
         if self.archivo_log:
             rutas.append(self.archivo_log)
             rutas.extend("{0}.{1}".format(self.archivo_log, i) for i in range(1, 10))
@@ -275,6 +436,24 @@ def es_error_certificado(e):
     return isinstance(e, ssl.SSLError) and "CERTIFICATE_VERIFY_FAILED" in str(e)
 
 
+def crear_contexto_ssl(certificados):
+    if certificados:
+        try:
+            return ssl.create_default_context(cafile=certificados)
+        except (OSError, ValueError) as e:
+            raise ErrorFatal("No se pudo cargar el archivo de certificados {0}: {1}".format(certificados, e))
+    try:
+        return ssl.create_default_context()
+    except (OSError, ValueError) as e:
+        # Python 3.4 en Windows falla si alguno de los almacenes de certificados está vacío.
+        log.warning("No se pudieron cargar los certificados de Windows (%s); configure 'certificados'.", e)
+        contexto = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
+        contexto.options |= ssl.OP_NO_SSLv2 | ssl.OP_NO_SSLv3
+        contexto.verify_mode = ssl.CERT_REQUIRED
+        contexto.check_hostname = True
+        return contexto
+
+
 class Respuesta(object):
     def __init__(self, estado, cabeceras, datos):
         self.estado = estado
@@ -298,10 +477,7 @@ class ClienteHttp(object):
     reutilizables por servidor."""
 
     def __init__(self, certificados=None, proxy=None, timeout=120):
-        try:
-            self.contexto = ssl.create_default_context(cafile=certificados or None)
-        except OSError as e:
-            raise ErrorFatal("No se pudo cargar el archivo de certificados {0}: {1}".format(certificados, e))
+        self.contexto = crear_contexto_ssl(certificados)
         self.proxy = analizar_proxy(proxy)
         self.timeout = timeout
         self._conexiones = {}
@@ -324,12 +500,18 @@ class ClienteHttp(object):
             self._conexiones[clave] = conexion
         return clave, conexion
 
-    def cerrar(self):
-        for conexion in self._conexiones.values():
+    def _descartar(self, clave):
+        conexion = self._conexiones.pop(clave, None)
+        if conexion is not None:
             conexion.close()
-        self._conexiones.clear()
 
-    def peticion(self, metodo, url, cuerpo=None, cabeceras=None):
+    def cerrar(self):
+        for clave in list(self._conexiones):
+            self._descartar(clave)
+
+    def peticion(self, metodo, url, cuerpo=None, cabeceras=None, al_enviar=None):
+        """Hace la petición y devuelve la Respuesta. Si se indica al_enviar, el cuerpo se
+        envía en trozos y se llama al_enviar(bytes_enviados) después de cada uno."""
         partes = urllib.parse.urlsplit(url)
         puerto = partes.port or (443 if partes.scheme == "https" else 80)
         ruta = partes.path or "/"
@@ -343,21 +525,32 @@ class ClienteHttp(object):
             cab["Content-Length"] = str(len(cuerpo))
         clave, conexion = self._conexion(partes.scheme, partes.hostname, puerto)
         try:
-            conexion.request(metodo, ruta, body=cuerpo, headers=cab)
+            conexion.putrequest(metodo, ruta)
+            for nombre, valor in cab.items():
+                conexion.putheader(nombre, valor)
+            conexion.endheaders()
+            if cuerpo:
+                for inicio in range(0, len(cuerpo), TROZO_ENVIO):
+                    conexion.send(cuerpo[inicio:inicio + TROZO_ENVIO])
+                    if al_enviar is not None:
+                        al_enviar(min(inicio + TROZO_ENVIO, len(cuerpo)))
             respuesta = conexion.getresponse()
             datos = respuesta.read()
         except (OSError, http.client.HTTPException, ssl.CertificateError) as e:
-            conexion.close()
-            del self._conexiones[clave]
+            self._descartar(clave)
             if es_error_certificado(e):
                 raise ErrorFatal(MENSAJE_CERTIFICADO.format(host=partes.hostname, error=e))
             raise ErrorTransitorio("error de red con {0} ({1})".format(partes.hostname, describir_error(e)))
+        except BaseException:
+            # Detenido (o Ctrl+C) a mitad de la petición: la conexión queda inservible.
+            self._descartar(clave)
+            raise
         log.debug("%s %s%s -> HTTP %d", metodo, partes.hostname, partes.path, respuesta.status)
         cabeceras_respuesta = dict((k.lower(), v) for k, v in respuesta.getheaders())
         return Respuesta(respuesta.status, cabeceras_respuesta, datos)
 
 
-def reintentar(funcion, descripcion, reintentos):
+def reintentar(funcion, descripcion, reintentos, esperar=None):
     """Ejecuta funcion() y la repite con espera creciente si lanza ErrorTransitorio."""
     intento = 0
     while True:
@@ -369,7 +562,7 @@ def reintentar(funcion, descripcion, reintentos):
                 raise ErrorNube("{0}: sigue fallando tras {1} reintentos ({2})".format(descripcion, reintentos, e))
             espera = calcular_espera(e, intento)
             log.warning("%s: %s. Reintento %d de %d en %d s.", descripcion, e, intento, reintentos, espera)
-            _dormir(espera)
+            (esperar or _dormir)(espera)
 
 
 def calcular_espera(error, intento):
@@ -423,13 +616,13 @@ class HashDropbox(object):
 
 class LectorArchivo(object):
     """Lee un archivo por bloques en cualquier posición y va calculando su suma
-    de verificación en orden, aunque haya que reenviar algún trozo."""
+    de verificación en orden. Si hay que saltar hacia adelante (al reanudar una
+    subida), lee la parte intermedia solo para la suma."""
 
-    def __init__(self, ruta, crear_hash):
-        self.crear_hash = crear_hash
+    def __init__(self, ruta, crear_hash, latido=None):
         self.hash = crear_hash()
         self.hasta = 0          # bytes ya incluidos en la suma
-        self.en_orden = True
+        self.latido = latido
         self.archivo = open(ruta, "rb")
 
     def __enter__(self):
@@ -438,48 +631,269 @@ class LectorArchivo(object):
     def __exit__(self, *_):
         self.archivo.close()
 
+    def _ponerse_al_dia(self, posicion):
+        if posicion - self.hasta > 64 * MB:
+            log.info("  Calculando la suma de la parte ya subida (%s)...", legible(posicion - self.hasta))
+        self.archivo.seek(self.hasta)
+        while self.hasta < posicion:
+            datos = self.archivo.read(min(8 * MB, posicion - self.hasta))
+            if not datos:
+                raise ErrorNube("el archivo se acortó mientras se subía; se volverá a intentar en la próxima ejecución")
+            self.hash.update(datos)
+            self.hasta += len(datos)
+            if self.latido is not None:
+                self.latido()
+
     def leer(self, posicion, cantidad):
+        if posicion > self.hasta:
+            self._ponerse_al_dia(posicion)
         self.archivo.seek(posicion)
         datos = self.archivo.read(cantidad)
         if len(datos) != cantidad:
             raise ErrorNube("el archivo se acortó mientras se subía; se volverá a intentar en la próxima ejecución")
-        if posicion > self.hasta:
-            self.en_orden = False
-        elif posicion + len(datos) > self.hasta:
+        if posicion + len(datos) > self.hasta:
             self.hash.update(memoryview(datos)[self.hasta - posicion:])
             self.hasta = posicion + len(datos)
         return datos
 
     def hash_hex(self, tamano):
-        if not self.en_orden or self.hasta != tamano:
-            # Se saltó algún trozo: se recalcula leyendo el archivo completo.
-            self.hash = self.crear_hash()
-            self.archivo.seek(0)
-            restante = tamano
-            while restante > 0:
-                datos = self.archivo.read(min(8 * MB, restante))
-                if not datos:
-                    break
-                self.hash.update(datos)
-                restante -= len(datos)
+        if self.hasta < tamano:
+            self._ponerse_al_dia(tamano)
         return self.hash.hexdigest()
 
 
-class Progreso(object):
-    """Registra el avance de un archivo grande cada 10 %."""
+# ---------------------------------------------------------------------------
+# Avance, historial y reanudación
+# ---------------------------------------------------------------------------
 
-    def __init__(self, nombre, total):
-        self.nombre = nombre
-        self.total = total
-        self.siguiente = 10
+class MonitorNulo(object):
+    """Monitor que no publica nada (simulaciones y pruebas de conexión)."""
 
-    def actualizar(self, hecho):
-        if self.total <= 0:
+    def latido(self):
+        pass
+
+    def comprobar_detener(self):
+        pass
+
+    def fase(self, texto):
+        pass
+
+    def avance(self, hecho):
+        pass
+
+    def esperar(self, segundos):
+        _dormir(segundos)
+
+    def inicio_lote(self, destino, cantidad, total):
+        pass
+
+    def inicio_archivo(self, relativa, tamano, indice):
+        pass
+
+    def fin_archivo(self):
+        pass
+
+
+class Actividad(MonitorNulo):
+    """Publica en actividad.json qué se está subiendo y cuánto falta, para que la
+    ventana lo muestre aunque la subida la haya lanzado el Programador de tareas.
+    También atiende la solicitud de detener que deja la ventana (detener.solicitud)."""
+
+    INTERVALO = 1.0
+
+    def __init__(self, conf, origen):
+        self.ruta = conf.archivo_actividad
+        self.ruta_detener = conf.archivo_detener
+        borrar_si_existe(self.ruta_detener)
+        ahora = time.time()
+        self.datos = {"activo": True, "pid": os.getpid(), "origen": origen, "inicio": ahora, "fin": None,
+                      "fase": "Buscando archivos", "destino": "", "archivo": "", "indice": 0, "cantidad": 0,
+                      "archivo_hecho": 0, "archivo_total": 0, "lote_hecho": 0, "lote_total": 0,
+                      "velocidad": 0.0, "resultado": "", "detalle": ""}
+        self._terminados = 0          # bytes de los archivos ya procesados en esta ejecución
+        self._muestras = collections.deque()
+        self._siguiente_registro = 10
+        self._guardado = 0.0
+        self._guardar(True)
+
+    def _guardar(self, forzar=False):
+        ahora = time.time()
+        if not forzar and ahora - self._guardado < self.INTERVALO:
             return
-        porcentaje = hecho * 100 // self.total
-        if self.siguiente <= porcentaje < 100:
-            log.info("  %s: %d%% (%s de %s)", self.nombre, porcentaje, legible(hecho), legible(self.total))
-            self.siguiente = (porcentaje // 10 + 1) * 10
+        self._guardado = ahora
+        self.datos["actualizado"] = ahora
+        try:
+            escribir_json(self.ruta, self.datos)
+        except OSError:
+            pass  # la ventana es opcional (o tiene el archivo abierto): la subida sigue
+
+    def comprobar_detener(self):
+        if os.path.exists(self.ruta_detener):
+            raise Detenido()
+
+    def latido(self):
+        self.comprobar_detener()
+        self._guardar()
+
+    def fase(self, texto):
+        self.datos["fase"] = texto
+        self._guardar(True)
+
+    def esperar(self, segundos):
+        anterior = self.datos["fase"]
+        self.fase("Esperando para reintentar")
+        restante = segundos
+        while restante > 0:
+            self.latido()
+            paso = min(5, restante)
+            _dormir(paso)
+            restante -= paso
+        self.latido()
+        self.fase(anterior)
+
+    def inicio_lote(self, destino, cantidad, total):
+        self.datos.update(destino=destino, cantidad=cantidad, lote_total=total, fase="Subiendo")
+        self._guardar(True)
+
+    def inicio_archivo(self, relativa, tamano, indice):
+        self.datos.update(archivo=relativa, archivo_total=tamano, archivo_hecho=0, indice=indice,
+                          velocidad=0.0, fase="Subiendo", lote_hecho=self._terminados)
+        self._muestras.clear()
+        self._siguiente_registro = 10
+        self._guardar(True)
+
+    def avance(self, hecho):
+        ahora = time.time()
+        if self._muestras and hecho < self._muestras[-1][1]:
+            self._muestras.clear()  # se reenvía una parte: la velocidad se mide de nuevo
+        self._muestras.append((ahora, hecho))
+        while len(self._muestras) > 2 and ahora - self._muestras[0][0] > 30:
+            self._muestras.popleft()
+        transcurrido = ahora - self._muestras[0][0]
+        if transcurrido >= 1:
+            self.datos["velocidad"] = (hecho - self._muestras[0][1]) / transcurrido
+        total = self.datos["archivo_total"]
+        self.datos["archivo_hecho"] = hecho
+        self.datos["lote_hecho"] = self._terminados + hecho
+        if total > 64 * MB:
+            porcentaje = hecho * 100 // total
+            if self._siguiente_registro <= porcentaje < 100:
+                log.info("  %s: %d%% (%s de %s)", self.datos["archivo"], porcentaje, legible(hecho), legible(total))
+                self._siguiente_registro = (porcentaje // 10 + 1) * 10
+        self.latido()
+
+    def fin_archivo(self):
+        self._terminados += self.datos["archivo_total"]
+        self.datos["lote_hecho"] = self._terminados
+        self._guardar(True)
+
+    def terminar(self, resultado, detalle):
+        self.datos.update(activo=False, fin=time.time(), resultado=resultado, detalle=detalle, velocidad=0.0,
+                          fase="Terminada")
+        self._guardar(True)
+        borrar_si_existe(self.ruta_detener)
+
+
+def leer_actividad(ruta):
+    """Estado de la última ejecución, con 'en_curso' calculado a partir del latido."""
+    datos = leer_json(ruta)
+    if datos:
+        reciente = time.time() - float(datos.get("actualizado") or 0) < 300
+        datos["en_curso"] = bool(datos.get("activo")) and reciente
+        datos["interrumpida"] = bool(datos.get("activo")) and not reciente
+    return datos
+
+
+class Historial(object):
+    """Registro de subidas y ejecuciones (una línea JSON por evento) que muestra la ventana."""
+
+    MAXIMO_BYTES = 2 * MB
+    CONSERVAR = 3000
+
+    def __init__(self, ruta):
+        self.ruta = ruta
+
+    def _agregar(self, entrada):
+        try:
+            with open(self.ruta, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entrada, ensure_ascii=False, sort_keys=True) + "\n")
+            if os.path.getsize(self.ruta) > self.MAXIMO_BYTES:
+                with open(self.ruta, "r", encoding="utf-8", errors="replace") as f:
+                    lineas = f.readlines()[-self.CONSERVAR:]
+                with open(self.ruta, "w", encoding="utf-8") as f:
+                    f.writelines(lineas)
+        except OSError as e:
+            log.warning("No se pudo escribir el historial %s: %s", self.ruta, e)
+
+    def archivo(self, relativa, destino, tamano, segundos, resultado, detalle="", verificado=False):
+        self._agregar({"tipo": "archivo", "fecha": fecha_local(), "archivo": relativa, "destino": destino,
+                       "tamano": tamano, "segundos": round(segundos, 1), "resultado": resultado,
+                       "detalle": detalle, "verificado": verificado})
+
+    def ejecucion(self, inicio, origen, resumen, resultado, detalle):
+        self._agregar({"tipo": "ejecucion", "fecha": fecha_local(inicio), "fin": fecha_local(),
+                       "origen": origen, "resultado": resultado, "detalle": detalle,
+                       "subidos": resumen.subidos, "bytes": resumen.bytes, "errores": resumen.errores})
+
+    @staticmethod
+    def leer(ruta, limite=1000):
+        """Últimas entradas (las más recientes al final)."""
+        entradas = []
+        try:
+            with open(ruta, "r", encoding="utf-8", errors="replace") as f:
+                lineas = f.readlines()[-limite:]
+        except OSError:
+            return entradas
+        for linea in lineas:
+            try:
+                entrada = json.loads(linea)
+            except ValueError:
+                continue
+            if isinstance(entrada, dict):
+                entradas.append(entrada)
+        return entradas
+
+
+class SinReanudacion(object):
+    datos = None
+
+    def guardar(self, **campos):
+        pass
+
+    def borrar(self):
+        pass
+
+
+class Reanudacion(object):
+    """Sesión de subida a medias guardada en estado.json, para continuar un archivo
+    grande en la próxima ejecución en lugar de empezar de cero."""
+
+    VIGENCIA = 6 * 86400   # Dropbox y Google mantienen las sesiones de subida una semana
+
+    def __init__(self, estado, clave, tamano, mtime):
+        self.estado = estado
+        self.clave = clave
+        self.tamano = tamano
+        self.mtime = int(mtime)
+        datos = estado.sesiones.get(clave)
+        if datos and (datos.get("tamano") != tamano or datos.get("mtime") != self.mtime
+                      or time.time() - datos.get("creada", 0) > self.VIGENCIA):
+            self.datos = datos
+            self.borrar()   # el archivo cambió o la sesión venció
+            datos = None
+        self.datos = datos
+
+    def guardar(self, **campos):
+        if self.datos is None:
+            self.datos = {"tamano": self.tamano, "mtime": self.mtime, "creada": time.time()}
+        self.datos.update(campos)
+        self.estado.sesiones[self.clave] = self.datos
+        self.estado.guardar()
+
+    def borrar(self):
+        self.datos = None
+        if self.estado.sesiones.pop(self.clave, None) is not None:
+            self.estado.guardar()
 
 
 # ---------------------------------------------------------------------------
@@ -489,34 +903,42 @@ class Progreso(object):
 class Proveedor(object):
     nombre = ""
     titulo = ""
+    tipo_autorizacion = ""
 
     def __init__(self, conf, http, tokens):
         self.conf = conf
         self.http = http
         self.tokens = tokens
+        self.monitor = MonitorNulo()
         self._token = None
         self._expira = 0.0
 
-    # Cada proveedor implementa: autorizar(), probar(), subir(), _pedir_token(), _mensaje_error().
+    # Cada proveedor implementa: probar(), subir(), _pedir_token(), _mensaje_error() y la autorización.
 
     def descripcion_destino(self):
         return "{0}:{1}".format(self.titulo, normalizar_remota(self.conf.carpeta_remota))
 
+    def vinculada(self):
+        return bool(self.tokens.obtener(self.nombre))
+
     def _reintentar(self, funcion, descripcion):
-        return reintentar(funcion, descripcion, self.conf.reintentos)
+        return reintentar(funcion, descripcion, self.conf.reintentos, self.monitor.esperar)
+
+    def _avance(self, base):
+        return lambda enviados: self.monitor.avance(base + enviados)
 
     def _token_acceso(self, renovar=False):
         if renovar or self._token is None or time.time() > self._expira - 300:
             refresh = self.tokens.obtener(self.nombre)
             if not refresh:
-                raise ErrorFatal("La cuenta de {0} no está vinculada. Ejecute primero: "
-                                 "python subir_nube.py autorizar".format(self.titulo))
+                raise ErrorFatal("La cuenta de {0} no está vinculada. Use 'Vincular cuenta' en la ventana o "
+                                 "ejecute: python subir_nube.py autorizar".format(self.titulo))
             r = self._pedir_token(refresh)
             self._comprobar_respuesta(r)
             datos = r.json()
             if r.estado != 200 or not datos.get("access_token"):
                 raise ErrorFatal("{0} no renovó el acceso (HTTP {1}: {2}). Si se revocó el permiso o "
-                                 "cambiaron las credenciales, ejecute de nuevo: python subir_nube.py autorizar"
+                                 "cambiaron las credenciales, vuelva a vincular la cuenta."
                                  .format(self.titulo, r.estado, self._mensaje_error(r)))
             self._token = datos["access_token"]
             self._expira = time.time() + int(datos.get("expires_in", 3600))
@@ -524,14 +946,14 @@ class Proveedor(object):
                 self.tokens.guardar(self.nombre, datos["refresh_token"])
         return self._token
 
-    def _llamar(self, metodo, url, cuerpo=None, cabeceras=None):
+    def _llamar(self, metodo, url, cuerpo=None, cabeceras=None, al_enviar=None):
         """Petición autenticada: renueva el token una vez si el servicio lo rechaza
         y convierte los errores temporales en ErrorTransitorio."""
         renovar = False
         while True:
             cab = dict(cabeceras or {})
             cab["Authorization"] = "Bearer " + self._token_acceso(renovar)
-            r = self.http.peticion(metodo, url, cuerpo, cab)
+            r = self.http.peticion(metodo, url, cuerpo, cab, al_enviar)
             if r.estado == 401 and not renovar:
                 renovar = True
                 continue
@@ -553,6 +975,7 @@ class Proveedor(object):
 class Dropbox(Proveedor):
     nombre = "dropbox"
     titulo = "Dropbox"
+    tipo_autorizacion = "codigo"
     URL_AUTORIZAR = "https://www.dropbox.com/oauth2/authorize"
     URL_TOKEN = "https://api.dropboxapi.com/oauth2/token"
     URL_API = "https://api.dropboxapi.com/2"
@@ -575,8 +998,8 @@ class Dropbox(Proveedor):
             if isinstance(error, dict) and error.get(".tag") == "missing_scope":
                 raise ErrorFatal(
                     "La app de Dropbox no tiene el permiso '{0}'. Márquelo en la pestaña Permissions de "
-                    "https://www.dropbox.com/developers/apps, pulse Submit y vuelva a ejecutar: "
-                    "python subir_nube.py autorizar".format(error.get("required_scope", "files.content.write")))
+                    "https://www.dropbox.com/developers/apps, pulse Submit y vuelva a vincular la cuenta."
+                    .format(error.get("required_scope", "files.content.write")))
 
     def _pedir_token(self, refresh):
         app_key, app_secret = self._credenciales()
@@ -584,17 +1007,16 @@ class Dropbox(Proveedor):
                   "client_id": app_key, "client_secret": app_secret}
         return self.http.peticion("POST", self.URL_TOKEN, formulario(campos), CABECERA_FORMULARIO)
 
-    def autorizar(self):
-        app_key, app_secret = self._credenciales()
-        url = self.URL_AUTORIZAR + "?" + urllib.parse.urlencode(
+    # -- Autorización: se abre una dirección en cualquier equipo y se pega el código.
+
+    def url_autorizacion(self):
+        app_key = self._credenciales()[0]
+        return self.URL_AUTORIZAR + "?" + urllib.parse.urlencode(
             {"client_id": app_key, "response_type": "code", "token_access_type": "offline"})
-        print()
-        print("1. Abra esta dirección en un navegador (puede ser en otro equipo o en el teléfono):")
-        print()
-        print("   " + url)
-        print()
-        print("2. Inicie sesión en Dropbox, pulse 'Permitir' y copie el código que aparece.")
-        codigo = input("3. Pegue aquí el código y pulse Enter: ").strip()
+
+    def completar_autorizacion(self, codigo):
+        app_key, app_secret = self._credenciales()
+        codigo = codigo.strip()
         if not codigo:
             raise ErrorFatal("No se ingresó ningún código.")
         campos = {"code": codigo, "grant_type": "authorization_code",
@@ -604,6 +1026,16 @@ class Dropbox(Proveedor):
         if r.estado != 200 or not datos.get("refresh_token"):
             raise ErrorFatal("Dropbox no aceptó el código: " + self._mensaje_error(r))
         return datos["refresh_token"]
+
+    def autorizar(self):
+        url = self.url_autorizacion()
+        print()
+        print("1. Abra esta dirección en un navegador (puede ser en otro equipo o en el teléfono):")
+        print()
+        print("   " + url)
+        print()
+        print("2. Inicie sesión en Dropbox, pulse 'Permitir' y copie el código que aparece.")
+        return self.completar_autorizacion(input("3. Pegue aquí el código y pulse Enter: "))
 
     def _rpc(self, ruta, descripcion):
         r = self._reintentar(lambda: self._llamar("POST", self.URL_API + "/" + ruta, b"null", CABECERA_JSON),
@@ -620,48 +1052,59 @@ class Dropbox(Proveedor):
             texto += " de " + legible(asignado)
         return texto
 
-    def _subir_contenido(self, ruta, argumento, datos):
+    def _subir_contenido(self, ruta, argumento, datos, base):
         cabeceras = {"Content-Type": "application/octet-stream",
                      # Debe ir en ASCII: json.dumps escapa los acentos como \uXXXX.
                      "Dropbox-API-Arg": json.dumps(argumento)}
-        return self._llamar("POST", self.URL_CONTENIDO + "/" + ruta, datos, cabeceras)
+        return self._llamar("POST", self.URL_CONTENIDO + "/" + ruta, datos, cabeceras, self._avance(base))
 
-    def subir(self, ruta_local, relativa, tamano, mtime):
+    def subir(self, ruta_local, relativa, tamano, mtime, reanudacion=None):
+        reanudacion = reanudacion or SinReanudacion()
         destino = "/" + "/".join(partes_remotas(self.conf.carpeta_remota) + relativa.split("/"))
         commit = {"path": destino, "mode": "overwrite", "autorename": False, "mute": True,
                   "client_modified": fecha_iso(mtime)}
         descripcion = "Subiendo " + relativa
-        with LectorArchivo(ruta_local, HashDropbox) as lector:
+        with LectorArchivo(ruta_local, HashDropbox, self.monitor.latido) as lector:
             if tamano <= self.conf.tamano_bloque:
                 datos = lector.leer(0, tamano)
-                r = self._reintentar(lambda: self._subir_contenido("files/upload", commit, datos), descripcion)
+                r = self._reintentar(lambda: self._subir_contenido("files/upload", commit, datos, 0), descripcion)
                 meta = self._exigir_ok(r, descripcion)
             else:
-                meta = self._subir_por_sesion(lector, tamano, commit, relativa)
+                meta = self._subir_por_sesion(lector, tamano, commit, relativa, reanudacion)
+            self.monitor.fase("Verificando")
             hash_local = lector.hash_hex(tamano)
+        reanudacion.borrar()
         return {"tamano": meta.get("size"), "hash_remoto": meta.get("content_hash"), "hash_local": hash_local}
 
-    def _subir_por_sesion(self, lector, tamano, commit, relativa):
-        """Archivos grandes: sesión de subida por bloques (start, append_v2, finish)."""
+    def _subir_por_sesion(self, lector, tamano, commit, relativa, reanudacion):
+        """Archivos grandes: sesión de subida por bloques (start, append_v2, finish).
+        La sesión se guarda para poder continuarla en otra ejecución."""
         descripcion = "Subiendo " + relativa
         bloque = self.conf.tamano_bloque
-        progreso = Progreso(relativa, tamano)
-        datos = lector.leer(0, bloque)
-        r = self._reintentar(lambda: self._subir_contenido("files/upload_session/start", {"close": False}, datos),
-                             descripcion)
-        sesion = self._exigir_ok(r, descripcion)["session_id"]
-        posicion = len(datos)
+        previa = reanudacion.datos if reanudacion.datos and reanudacion.datos.get("proveedor") == self.nombre else None
+        if previa:
+            sesion, posicion = previa["sesion"], int(previa.get("posicion", 0))
+            log.info("  Se reanuda %s desde %s de %s.", relativa, legible(posicion), legible(tamano))
+            self.monitor.fase("Reanudando")
+        else:
+            datos = lector.leer(0, bloque)
+            r = self._reintentar(lambda: self._subir_contenido("files/upload_session/start", {"close": False},
+                                                               datos, 0), descripcion)
+            sesion = self._exigir_ok(r, descripcion)["session_id"]
+            posicion = len(datos)
+            reanudacion.guardar(proveedor=self.nombre, sesion=sesion, posicion=posicion)
         correcciones = 0
         while True:
-            progreso.actualizar(posicion)
+            self.monitor.avance(posicion)
             final = tamano - posicion <= bloque
             datos = lector.leer(posicion, min(bloque, tamano - posicion))
+            self.monitor.fase("Subiendo")
             cursor = {"session_id": sesion, "offset": posicion}
             if final:
                 ruta, argumento = "files/upload_session/finish", {"cursor": cursor, "commit": commit}
             else:
                 ruta, argumento = "files/upload_session/append_v2", {"cursor": cursor, "close": False}
-            r = self._reintentar(lambda: self._subir_contenido(ruta, argumento, datos), descripcion)
+            r = self._reintentar(lambda: self._subir_contenido(ruta, argumento, datos, posicion), descripcion)
             correcta = self._posicion_correcta(r)
             if correcta is not None:
                 # Dropbox ya tenía más (o menos) datos: p. ej., la respuesta anterior se perdió.
@@ -670,27 +1113,41 @@ class Dropbox(Proveedor):
                     raise ErrorNube("{0}: Dropbox no acepta la posición de la subida.".format(descripcion))
                 log.info("  %s: Dropbox indica continuar desde %s.", relativa, legible(correcta))
                 posicion = correcta
+                reanudacion.guardar(posicion=posicion)
                 continue
+            if previa and self._sesion_invalida(r):
+                log.warning("  La subida pendiente de %s ya no es válida en Dropbox; se empieza de nuevo.", relativa)
+                reanudacion.borrar()
+                return self._subir_por_sesion(lector, tamano, commit, relativa, reanudacion)
             meta = self._exigir_ok(r, descripcion)
             if final:
                 return meta
             posicion += len(datos)
+            reanudacion.guardar(posicion=posicion)
 
     @staticmethod
-    def _posicion_correcta(r):
+    def _error_sesion(r):
         if r.estado != 409:
-            return None
+            return {}
         error = r.json().get("error", {})
         if isinstance(error, dict) and error.get(".tag") == "lookup_failed":
             error = error.get("lookup_failed", {})
-        if isinstance(error, dict) and error.get(".tag") == "incorrect_offset":
-            return error.get("correct_offset")
-        return None
+        return error if isinstance(error, dict) else {}
+
+    @classmethod
+    def _posicion_correcta(cls, r):
+        error = cls._error_sesion(r)
+        return error.get("correct_offset") if error.get(".tag") == "incorrect_offset" else None
+
+    @classmethod
+    def _sesion_invalida(cls, r):
+        return cls._error_sesion(r).get(".tag") in ("not_found", "closed", "not_closed")
 
 
 class GoogleDrive(Proveedor):
     nombre = "gdrive"
     titulo = "Google Drive"
+    tipo_autorizacion = "dispositivo"
     # drive.file: solo da acceso a los archivos y carpetas que crea este programa.
     ALCANCE = "https://www.googleapis.com/auth/drive.file"
     URL_DISPOSITIVO = "https://oauth2.googleapis.com/device/code"
@@ -731,10 +1188,11 @@ class GoogleDrive(Proveedor):
                   "client_id": client_id, "client_secret": client_secret}
         return self.http.peticion("POST", self.URL_TOKEN, formulario(campos), CABECERA_FORMULARIO)
 
-    def autorizar(self):
-        """Flujo para dispositivos: se autoriza desde cualquier otro equipo o teléfono,
-        así que no hace falta un navegador moderno en el servidor."""
-        client_id, client_secret = self._credenciales()
+    # -- Autorización para dispositivos: se escribe un código en google.com/device desde
+    #    cualquier equipo o teléfono, así que no hace falta un navegador moderno en el servidor.
+
+    def iniciar_autorizacion(self):
+        client_id = self._credenciales()[0]
         r = self.http.peticion("POST", self.URL_DISPOSITIVO,
                                formulario({"client_id": client_id, "scope": self.ALCANCE}), CABECERA_FORMULARIO)
         datos = r.json()
@@ -742,28 +1200,30 @@ class GoogleDrive(Proveedor):
             raise ErrorFatal("Google rechazó la solicitud ({0}). Compruebe que el ID de cliente OAuth sea del tipo "
                              "'TVs y dispositivos de entrada limitada' y que la API de Google Drive esté habilitada."
                              .format(self._mensaje_error(r)))
-        print()
-        direccion = datos.get("verification_url") or datos.get("verification_uri") or "https://www.google.com/device"
-        print("1. En cualquier equipo o teléfono abra: " + direccion)
-        print("2. Escriba este código: " + datos["user_code"])
-        print("3. Elija la cuenta de Google y acepte los permisos.")
-        print()
-        print("Esperando la autorización (puede cancelar con Ctrl+C)...")
+        datos["direccion"] = (datos.get("verification_url") or datos.get("verification_uri")
+                              or "https://www.google.com/device")
+        return datos
+
+    def esperar_autorizacion(self, datos, cancelado=None):
+        client_id, client_secret = self._credenciales()
         intervalo = int(datos.get("interval", 5))
         limite = time.time() + int(datos.get("expires_in", 1800))
         campos = {"client_id": client_id, "client_secret": client_secret, "device_code": datos["device_code"],
                   "grant_type": "urn:ietf:params:oauth:grant-type:device_code"}
         while time.time() < limite:
-            _dormir(intervalo)
+            for _ in range(intervalo):
+                if cancelado is not None and cancelado():
+                    raise ErrorFatal("Se canceló la vinculación.")
+                _dormir(1)
             try:
                 r = self.http.peticion("POST", self.URL_TOKEN, formulario(campos), CABECERA_FORMULARIO)
             except ErrorTransitorio as e:
                 log.warning("Sin respuesta de Google (%s); se sigue esperando.", e)
                 continue
-            datos = r.json()
-            if r.estado == 200 and datos.get("refresh_token"):
-                return datos["refresh_token"]
-            error = datos.get("error")
+            respuesta = r.json()
+            if r.estado == 200 and respuesta.get("refresh_token"):
+                return respuesta["refresh_token"]
+            error = respuesta.get("error")
             if error == "authorization_pending":
                 continue
             if error == "slow_down":
@@ -772,7 +1232,17 @@ class GoogleDrive(Proveedor):
             if error == "access_denied":
                 raise ErrorFatal("Se rechazó el permiso en la cuenta de Google.")
             raise ErrorFatal("Google no completó la autorización: " + self._mensaje_error(r))
-        raise ErrorFatal("El código expiró antes de que se autorizara. Ejecute 'autorizar' de nuevo.")
+        raise ErrorFatal("El código expiró antes de que se autorizara. Vuelva a intentarlo.")
+
+    def autorizar(self):
+        datos = self.iniciar_autorizacion()
+        print()
+        print("1. En cualquier equipo o teléfono abra: " + datos["direccion"])
+        print("2. Escriba este código: " + datos["user_code"])
+        print("3. Elija la cuenta de Google y acepte los permisos.")
+        print()
+        print("Esperando la autorización (puede cancelar con Ctrl+C)...")
+        return self.esperar_autorizacion(datos)
 
     def probar(self):
         url = self.URL_API + "/about?" + urllib.parse.urlencode(
@@ -822,17 +1292,33 @@ class GoogleDrive(Proveedor):
             self._carpetas[clave] = identificador
         return self._carpetas[clave]
 
-    def subir(self, ruta_local, relativa, tamano, mtime):
-        partes = partes_remotas(self.conf.carpeta_remota) + relativa.split("/")
-        padre = self._carpeta(tuple(partes[:-1]))
-        nombre = partes[-1]
-        existente = self._buscar(nombre, padre, False)
+    def subir(self, ruta_local, relativa, tamano, mtime, reanudacion=None):
+        reanudacion = reanudacion or SinReanudacion()
         descripcion = "Subiendo " + relativa
-        sesion = self._reintentar(lambda: self._iniciar_sesion(nombre, padre, existente, tamano, mtime, descripcion),
-                                  descripcion)
-        with LectorArchivo(ruta_local, hashlib.md5) as lector:
-            meta = self._subida_reanudable(sesion, lector, tamano, relativa)
+        previa = reanudacion.datos if reanudacion.datos and reanudacion.datos.get("proveedor") == self.nombre else None
+        with LectorArchivo(ruta_local, hashlib.md5, self.monitor.latido) as lector:
+            meta = None
+            if previa:
+                log.info("  Se reanuda la subida pendiente de %s.", relativa)
+                self.monitor.fase("Reanudando")
+                meta = self._subida_reanudable(previa["sesion"], lector, tamano, relativa, consultar=True)
+                if meta is None:
+                    log.warning("  La subida pendiente de %s venció en Google Drive; se empieza de nuevo.", relativa)
+                    reanudacion.borrar()
+            if meta is None:
+                partes = partes_remotas(self.conf.carpeta_remota) + relativa.split("/")
+                padre = self._carpeta(tuple(partes[:-1]))
+                existente = self._buscar(partes[-1], padre, False)
+                sesion = self._reintentar(
+                    lambda: self._iniciar_sesion(partes[-1], padre, existente, tamano, mtime, descripcion), descripcion)
+                reanudacion.guardar(proveedor=self.nombre, sesion=sesion)
+                meta = self._subida_reanudable(sesion, lector, tamano, relativa, consultar=False)
+                if meta is None:
+                    raise ErrorNube(descripcion + ": la sesión de subida expiró; se volverá a intentar "
+                                    "en la próxima ejecución.")
+            self.monitor.fase("Verificando")
             hash_local = lector.hash_hex(tamano)
+        reanudacion.borrar()
         if meta.get("id") and (meta.get("size") is None or not meta.get("md5Checksum")):
             url = self.URL_API + "/files/" + meta["id"] + "?fields=" + self.CAMPOS
             r = self._reintentar(lambda: self._llamar("GET", url), descripcion)
@@ -859,26 +1345,29 @@ class GoogleDrive(Proveedor):
             raise ErrorNube(descripcion + ": Google Drive no devolvió la dirección de la sesión de subida.")
         return r.cabeceras["location"]
 
-    def _subida_reanudable(self, sesion, lector, tamano, relativa):
-        """Envía el archivo por bloques. Si un bloque falla, pregunta a Google cuánto
-        recibió y continúa desde ahí. La URL de la sesión ya autoriza la subida."""
+    def _subida_reanudable(self, sesion, lector, tamano, relativa, consultar):
+        """Envía el archivo por bloques. Si un bloque falla (o se reanuda una subida de
+        otra ejecución), pregunta a Google cuánto recibió y continúa desde ahí.
+        Devuelve los metadatos del archivo, o None si la sesión ya no existe.
+        La URL de la sesión ya autoriza la subida."""
         descripcion = "Subiendo " + relativa
-        progreso = Progreso(relativa, tamano)
         posicion = 0
         fallos = 0
         sin_avance = 0
         while True:
             try:
-                if fallos:
+                if consultar or fallos:
                     r = self.http.peticion("PUT", sesion, b"", {"Content-Range": "bytes */{0}".format(tamano)})
                 else:
+                    self.monitor.avance(posicion)
                     n = min(self.conf.tamano_bloque, tamano - posicion)
                     datos = lector.leer(posicion, n)
+                    self.monitor.fase("Subiendo")
                     if n:
                         rango = "bytes {0}-{1}/{2}".format(posicion, posicion + n - 1, tamano)
                     else:
                         rango = "bytes */{0}".format(tamano)
-                    r = self.http.peticion("PUT", sesion, datos, {"Content-Range": rango})
+                    r = self.http.peticion("PUT", sesion, datos, {"Content-Range": rango}, self._avance(posicion))
                 self._comprobar_respuesta(r)
             except ErrorTransitorio as e:
                 fallos += 1
@@ -887,9 +1376,10 @@ class GoogleDrive(Proveedor):
                         descripcion, self.conf.reintentos, e))
                 espera = calcular_espera(e, fallos)
                 log.warning("%s: %s. Reintento %d de %d en %d s.", descripcion, e, fallos, self.conf.reintentos, espera)
-                _dormir(espera)
+                self.monitor.esperar(espera)
                 continue
-            consulta = fallos > 0
+            era_consulta = consultar or fallos > 0
+            consultar = False
             fallos = 0
             if r.estado in (200, 201):
                 return r.json()
@@ -897,46 +1387,49 @@ class GoogleDrive(Proveedor):
                 anterior = posicion
                 rango = r.cabeceras.get("range")  # "bytes=0-1048575": recibido hasta ese byte
                 posicion = int(rango.rsplit("-", 1)[1]) + 1 if rango else 0
-                if not consulta:
+                if not era_consulta:
                     sin_avance = sin_avance + 1 if posicion <= anterior else 0
                     if sin_avance > self.conf.reintentos:
                         raise ErrorNube(descripcion + ": Google Drive no está aceptando los datos.")
-                progreso.actualizar(posicion)
+                elif posicion:
+                    log.info("  Google Drive ya tiene %s de %s; se continúa desde ahí.", legible(posicion),
+                             legible(tamano))
                 continue
             if r.estado in (404, 410):
-                raise ErrorNube(descripcion + ": la sesión de subida expiró; se volverá a intentar "
-                                "en la próxima ejecución.")
+                return None
             raise ErrorNube("{0}: HTTP {1} ({2})".format(descripcion, r.estado, self._mensaje_error(r)))
 
 
 PROVEEDORES = {"dropbox": Dropbox, "gdrive": GoogleDrive}
 
 
+def crear_proveedor(conf):
+    """Proveedor configurado, listo para usar. Recuerde cerrar proveedor.http al terminar."""
+    http = ClienteHttp(conf.certificados, conf.proxy, conf.timeout)
+    return PROVEEDORES[conf.proveedor](conf, http, AlmacenTokens(conf.archivo_tokens))
+
+
 # ---------------------------------------------------------------------------
 # Estado, permisos guardados y bloqueo
 # ---------------------------------------------------------------------------
 
-def escribir_json(ruta, datos):
-    """Escribe en un temporal y lo renombra, para no dejar el archivo a medias."""
-    temporal = ruta + ".tmp"
-    with open(temporal, "w", encoding="utf-8") as f:
-        json.dump(datos, f, indent=1, sort_keys=True, ensure_ascii=False)
-    os.replace(temporal, ruta)
-
-
 class Estado(object):
-    """Recuerda qué archivos ya se subieron (tamaño y fecha) para no repetirlos."""
+    """Recuerda qué archivos ya se subieron (tamaño y fecha) para no repetirlos, y
+    las subidas que quedaron a medias para continuarlas."""
 
     def __init__(self, ruta):
         self.ruta = ruta
         self.archivos = {}
+        self.sesiones = {}
         if os.path.exists(ruta):
             try:
                 with open(ruta, "r", encoding="utf-8") as f:
-                    self.archivos = json.load(f).get("archivos", {})
+                    datos = json.load(f)
+                self.archivos = datos.get("archivos", {})
+                self.sesiones = datos.get("sesiones", {})
             except (OSError, ValueError, AttributeError) as e:
                 log.warning("No se pudo leer %s (%s); se revisarán todos los archivos de nuevo.", ruta, e)
-                self.archivos = {}
+                self.archivos, self.sesiones = {}, {}
 
     @staticmethod
     def clave(destino, relativa):
@@ -947,7 +1440,7 @@ class Estado(object):
         return bool(entrada) and entrada.get("tamano") == tamano and entrada.get("mtime") == int(mtime)
 
     def marcar(self, clave, tamano, mtime):
-        self.archivos[clave] = {"tamano": tamano, "mtime": int(mtime), "subido": time.strftime("%Y-%m-%d %H:%M:%S")}
+        self.archivos[clave] = {"tamano": tamano, "mtime": int(mtime), "subido": fecha_local()}
         self.guardar()
 
     def olvidar(self, clave):
@@ -957,15 +1450,17 @@ class Estado(object):
     def podar(self, destino, vigentes):
         """Quita las entradas de archivos que ya no existen en el origen."""
         prefijo = destino + "|"
-        sobrantes = [c for c in self.archivos if c.startswith(prefijo) and c[len(prefijo):] not in vigentes]
-        for clave in sobrantes:
-            del self.archivos[clave]
-        if sobrantes:
+        cambio = False
+        for tabla in (self.archivos, self.sesiones):
+            for clave in [c for c in tabla if c.startswith(prefijo) and c[len(prefijo):] not in vigentes]:
+                del tabla[clave]
+                cambio = True
+        if cambio:
             self.guardar()
 
     def guardar(self):
         try:
-            escribir_json(self.ruta, {"version": 1, "archivos": self.archivos})
+            escribir_json(self.ruta, {"version": 2, "archivos": self.archivos, "sesiones": self.sesiones})
         except OSError as e:
             # Sin estado guardado solo se pierde eficiencia: se volverá a subir en la próxima ejecución.
             log.warning("No se pudo guardar %s: %s", self.ruta, e)
@@ -993,7 +1488,7 @@ class AlmacenTokens(object):
 
     def guardar(self, proveedor, refresh_token):
         datos = self._leer()
-        datos[proveedor] = {"refresh_token": refresh_token, "fecha": time.strftime("%Y-%m-%d %H:%M:%S")}
+        datos[proveedor] = {"refresh_token": refresh_token, "fecha": fecha_local()}
         escribir_json(self.ruta, datos)
 
 
@@ -1082,6 +1577,7 @@ class Resumen(object):
         self.recientes = 0
         self.borrados = 0
         self.errores = 0
+        self.detenido = False
 
     def texto(self, simular=False):
         verbo = "se subirían" if simular else "subidos"
@@ -1091,12 +1587,16 @@ class Resumen(object):
                   "{0} con error".format(self.errores)]
         if self.borrados:
             partes.append("{0} borrados del disco local".format(self.borrados))
-        return "Resumen: " + ", ".join(partes) + "."
+        texto = "Resumen: " + ", ".join(partes) + "."
+        if self.detenido:
+            texto += " Detenida por el usuario: continuará en la próxima ejecución."
+        return texto
 
 
-def ejecutar_subida(conf, proveedor, simular=False):
+def ejecutar_subida(conf, proveedor, simular=False, actividad=None, historial=None):
+    actividad = actividad or MonitorNulo()
     if not conf.origen:
-        raise ErrorFatal("Falta 'origen' en la sección [general] de {0}.".format(conf.ruta))
+        raise ErrorFatal("Falta la carpeta de origen en la configuración.")
     if not os.path.isdir(conf.origen):
         raise ErrorFatal("La carpeta de origen no existe o no es accesible: {0}".format(conf.origen))
     estado = Estado(conf.archivo_estado)
@@ -1106,6 +1606,7 @@ def ejecutar_subida(conf, proveedor, simular=False):
              len(archivos), ";".join(conf.patrones))
     resumen = Resumen()
     ahora = time.time()
+    pendientes = []
     for ruta, relativa in archivos:
         try:
             info = os.stat(ruta)
@@ -1113,31 +1614,46 @@ def ejecutar_subida(conf, proveedor, simular=False):
             log.error("No se puede leer %s: %s", relativa, e)
             resumen.errores += 1
             continue
-        tamano, mtime = info.st_size, info.st_mtime
         clave = Estado.clave(destino, relativa)
-        if estado.ya_subido(clave, tamano, mtime):
+        if estado.ya_subido(clave, info.st_size, info.st_mtime):
             log.debug("Sin cambios: %s", relativa)
             resumen.sin_cambios += 1
-            continue
-        if ahora - mtime < conf.antiguedad_minima:
+        elif ahora - info.st_mtime < conf.antiguedad_minima:
             log.info("Queda para la próxima ejecución %s: se modificó hace menos de %d min (podría estar "
                      "escribiéndose).", relativa, conf.antiguedad_minima // 60)
             resumen.recientes += 1
-            continue
-        if simular:
-            log.info("[simulación] Se subiría %s (%s)", relativa, legible(tamano))
+        elif simular:
+            log.info("[simulación] Se subiría %s (%s)", relativa, legible(info.st_size))
             resumen.subidos += 1
-            resumen.bytes += tamano
-            continue
+            resumen.bytes += info.st_size
+        else:
+            pendientes.append((ruta, relativa, info.st_size, info.st_mtime, clave))
+    if simular:
+        return resumen
 
-        log.info("Subiendo %s (%s)...", relativa, legible(tamano))
+    actividad.inicio_lote(proveedor.descripcion_destino(), len(pendientes), sum(p[2] for p in pendientes))
+    for indice, (ruta, relativa, tamano, mtime, clave) in enumerate(pendientes, 1):
         inicio = time.time()
         try:
-            resultado = proveedor.subir(ruta, relativa, tamano, mtime)
+            actividad.comprobar_detener()
+            actividad.inicio_archivo(relativa, tamano, indice)
+            log.info("Subiendo %s (%s)...", relativa, legible(tamano))
+            reanudacion = Reanudacion(estado, clave, tamano, mtime)
+            resultado = proveedor.subir(ruta, relativa, tamano, mtime, reanudacion)
             verificado = comprobar_subida(resultado, ruta, tamano, mtime)
+        except Detenido:
+            log.warning("Subida detenida por el usuario en %s; continuará en la próxima ejecución.", relativa)
+            if historial:
+                historial.archivo(relativa, destino, tamano, time.time() - inicio, "detenido",
+                                  "Continuará en la próxima ejecución.")
+            resumen.detenido = True
+            break
         except (ErrorNube, ErrorTransitorio, OSError) as e:
             log.error("No se pudo subir %s: %s", relativa, e)
+            if historial:
+                historial.archivo(relativa, destino, tamano, time.time() - inicio, "error", str(e))
             resumen.errores += 1
+            actividad.fin_archivo()
             continue
         estado.marcar(clave, tamano, mtime)
         resumen.subidos += 1
@@ -1145,36 +1661,177 @@ def ejecutar_subida(conf, proveedor, simular=False):
         segundos = max(time.time() - inicio, 0.001)
         log.info("Subido %s en %s (%s/s)%s.", relativa, duracion(segundos), legible(int(tamano / segundos)),
                  ", suma de verificación correcta" if verificado else "")
+        detalle = "Suma de verificación correcta." if verificado else ""
 
         if conf.borrar_local:
             if not verificado:
                 log.warning("No se borra %s: no se pudo verificar la suma en la nube.", relativa)
-                continue
-            try:
-                os.remove(ruta)
-            except OSError as e:
-                log.warning("No se pudo borrar el archivo local %s: %s", relativa, e)
             else:
-                estado.olvidar(clave)
-                resumen.borrados += 1
-                log.info("Borrado del disco local: %s", relativa)
+                try:
+                    os.remove(ruta)
+                except OSError as e:
+                    log.warning("No se pudo borrar el archivo local %s: %s", relativa, e)
+                else:
+                    estado.olvidar(clave)
+                    resumen.borrados += 1
+                    detalle += " Borrado del disco local."
+                    log.info("Borrado del disco local: %s", relativa)
+        if historial:
+            historial.archivo(relativa, destino, tamano, segundos, "subido", detalle.strip(), verificado)
+        actividad.fin_archivo()
 
-    if not simular:
-        estado.podar(destino, set(relativa for _, relativa in archivos))
+    estado.podar(destino, set(relativa for _, relativa in archivos))
     return resumen
 
 
-def subir_con_bloqueo(conf, proveedor, simular):
+def subir_con_bloqueo(conf, proveedor, simular=False, origen="consola"):
     bloqueo = Bloqueo(conf.archivo_estado + ".lock")
     if not bloqueo.adquirir():
-        log.warning("Ya hay otra ejecución en curso que usa %s; esta termina sin hacer nada.", conf.archivo_estado)
+        log.warning("Ya hay otra subida en curso que usa %s; esta termina sin hacer nada.", conf.archivo_estado)
         return 0
+    if simular:
+        try:
+            resumen = ejecutar_subida(conf, proveedor, simular=True)
+        finally:
+            bloqueo.liberar()
+        log.info("%s", resumen.texto(simular=True))
+        return 0
+
+    inicio = time.time()
+    historial = Historial(conf.archivo_historial)
+    actividad = Actividad(conf, origen)
+    proveedor.monitor = actividad
+    resumen = Resumen()
     try:
-        resumen = ejecutar_subida(conf, proveedor, simular)
+        resumen = ejecutar_subida(conf, proveedor, actividad=actividad, historial=historial)
+    except BaseException as e:
+        detalle = str(e) if isinstance(e, ErrorFatal) else describir_error(e)
+        historial.ejecucion(inicio, origen, resumen, "fallida", detalle)
+        actividad.terminar("fallida", detalle)
+        raise
     finally:
         bloqueo.liberar()
-    log.info("%s", resumen.texto(simular))
-    return 1 if resumen.errores else 0
+    detalle = resumen.texto()
+    log.info("%s", detalle)
+    if resumen.detenido:
+        resultado, codigo = "detenida", 4
+    elif resumen.errores:
+        resultado, codigo = "con errores", 1
+    else:
+        resultado, codigo = "correcta", 0
+    historial.ejecucion(inicio, origen, resumen, resultado, detalle)
+    actividad.terminar(resultado, detalle)
+    return codigo
+
+
+# ---------------------------------------------------------------------------
+# Tarea programada de Windows (schtasks)
+# ---------------------------------------------------------------------------
+
+class Programacion(object):
+    def __init__(self, activa=False, frecuencia="diaria", hora="03:30", dias=None, cada_horas=4, usuario=""):
+        self.activa = activa
+        self.frecuencia = frecuencia
+        self.hora = hora
+        self.dias = list(dias or [])
+        self.cada_horas = cada_horas
+        self.usuario = usuario
+
+    def descripcion(self):
+        if not self.activa:
+            return "Sin subida automática."
+        if self.frecuencia == "diaria":
+            texto = "Todos los días a las {0}".format(self.hora)
+        elif self.frecuencia == "semanal":
+            nombres = [d[2] for d in DIAS_SEMANA if d[0] in self.dias]
+            unidos = nombres[0] if len(nombres) == 1 else ", ".join(nombres[:-1]) + " y " + nombres[-1]
+            texto = "Los {0} a las {1}".format(unidos, self.hora)
+        else:
+            texto = "Cada {0} hora(s) a partir de las {1}".format(self.cada_horas, self.hora)
+        return texto + ", con la cuenta {0}.".format(self.usuario or "SYSTEM")
+
+
+def es_windows_antiguo():
+    """XP/2003: schtasks usa otro formato de hora y no tiene /f ni /query /tn."""
+    return os.name == "nt" and sys.getwindowsversion().major < 6
+
+
+def comando_tarea(ruta_config):
+    """Línea que ejecuta la tarea: pythonw (sin ventana) con este script."""
+    pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    if not os.path.exists(pythonw):
+        pythonw = sys.executable
+    return '"{0}" "{1}" subir -c "{2}" --origen programada'.format(
+        pythonw, os.path.abspath(__file__), os.path.abspath(ruta_config))
+
+
+def argumentos_crear_tarea(programacion, comando, antiguo, clave=None):
+    hora = programacion.hora + (":00" if antiguo else "")
+    argumentos = ["schtasks", "/create", "/tn", NOMBRE_TAREA, "/tr", comando]
+    if programacion.frecuencia == "diaria":
+        argumentos += ["/sc", "daily", "/st", hora]
+    elif programacion.frecuencia == "semanal":
+        dias = [d[1] for d in DIAS_SEMANA if d[0] in programacion.dias]
+        argumentos += ["/sc", "weekly", "/d", ",".join(dias), "/st", hora]
+    else:
+        argumentos += ["/sc", "hourly", "/mo", str(programacion.cada_horas), "/st", hora]
+    if programacion.usuario:
+        argumentos += ["/ru", programacion.usuario, "/rp", clave or ""]
+    else:
+        argumentos += ["/ru", "SYSTEM"]
+    if not antiguo:
+        argumentos.append("/f")
+    return argumentos
+
+
+def ejecutar_schtasks(argumentos):
+    """Ejecuta schtasks sin abrir ninguna ventana. Devuelve (código, salida)."""
+    opciones = {}
+    codificacion = "latin-1"
+    if os.name == "nt":
+        import ctypes
+        opciones["creationflags"] = 0x08000000   # CREATE_NO_WINDOW
+        codificacion = "cp{0}".format(ctypes.windll.kernel32.GetOEMCP())
+    try:
+        proceso = subprocess.Popen(argumentos, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, **opciones)
+        salida = proceso.communicate(timeout=60)[0]
+    except (OSError, subprocess.SubprocessError) as e:
+        return -1, describir_error(e)
+    try:
+        texto = salida.decode(codificacion, "replace")
+    except LookupError:
+        texto = salida.decode("latin-1")
+    return proceso.returncode, texto.strip()
+
+
+def tarea_existe():
+    if os.name != "nt":
+        return False
+    if es_windows_antiguo():
+        carpeta = os.environ.get("SystemRoot", r"C:\WINDOWS")
+        return os.path.exists(os.path.join(carpeta, "Tasks", NOMBRE_TAREA + ".job"))
+    return ejecutar_schtasks(["schtasks", "/query", "/tn", NOMBRE_TAREA])[0] == 0
+
+
+def aplicar_programacion(programacion, ruta_config, clave=None):
+    """Crea, reemplaza o quita la tarea programada de Windows. Devuelve un texto para
+    mostrar; lanza ErrorFatal si Windows la rechaza."""
+    if os.name != "nt":
+        raise ErrorFatal("La tarea programada solo se puede crear en Windows.")
+    if tarea_existe():
+        codigo, salida = ejecutar_schtasks(["schtasks", "/delete", "/tn", NOMBRE_TAREA, "/f"])
+        if codigo != 0:
+            raise ErrorFatal("Windows no pudo quitar la tarea anterior: " + salida)
+    if not programacion.activa:
+        return "Se quitó la subida automática."
+    if programacion.usuario and not clave:
+        raise ErrorFatal("Falta la contraseña de la cuenta {0}.".format(programacion.usuario))
+    argumentos = argumentos_crear_tarea(programacion, comando_tarea(ruta_config), es_windows_antiguo(), clave)
+    codigo, salida = ejecutar_schtasks(argumentos)
+    if codigo != 0:
+        raise ErrorFatal("Windows no pudo crear la tarea programada: " + (salida or "código {0}".format(codigo)))
+    return "Subida automática programada: " + programacion.descripcion()
 
 
 # ---------------------------------------------------------------------------
@@ -1211,31 +1868,40 @@ def agregar_archivo_registro(ruta):
     log.addHandler(archivo)
 
 
+def ruta_config_predeterminada():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "subir_nube.ini")
+
+
 def main(argv=None):
     analizador = argparse.ArgumentParser(
         prog="subir_nube.py", description="Copia los archivos de una carpeta local a Dropbox o Google Drive.")
-    analizador.add_argument("accion", nargs="?", default="subir", choices=("subir", "autorizar", "probar"),
-                            help="subir (por defecto), autorizar la cuenta o probar la conexión")
-    analizador.add_argument("-c", "--config",
-                            default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "subir_nube.ini"),
+    analizador.add_argument("accion", nargs="?", default="subir",
+                            choices=("subir", "autorizar", "probar", "programar"),
+                            help="subir (por defecto), autorizar la cuenta, probar la conexión o programar la tarea")
+    analizador.add_argument("-c", "--config", default=ruta_config_predeterminada(),
                             help="archivo de configuración (por defecto subir_nube.ini junto al script)")
     analizador.add_argument("--simular", action="store_true", help="muestra qué se subiría, sin subir nada")
     analizador.add_argument("-v", "--detallado", action="store_true", help="registra también la depuración")
+    analizador.add_argument("--origen", default="consola", choices=("consola", "manual", "programada"),
+                            help=argparse.SUPPRESS)
     args = analizador.parse_args(argv)
 
     configurar_registro(args.detallado)
-    http = None
+    proveedor = None
     try:
         conf = Configuracion(args.config)
         agregar_archivo_registro(conf.archivo_log)
         log.debug("subir_nube %s, Python %s, %s", VERSION, sys.version.split()[0], ssl.OPENSSL_VERSION)
-        http = ClienteHttp(conf.certificados, conf.proxy, conf.timeout)
-        tokens = AlmacenTokens(conf.archivo_tokens)
-        proveedor = PROVEEDORES[conf.proveedor](conf, http, tokens)
-
+        if args.accion == "programar":
+            clave = None
+            if conf.programacion.activa and conf.programacion.usuario:
+                clave = getpass.getpass("Contraseña de {0}: ".format(conf.programacion.usuario))
+            log.info("%s", aplicar_programacion(conf.programacion, conf.ruta, clave))
+            return 0
+        proveedor = crear_proveedor(conf)
         if args.accion == "autorizar":
             refresh = proveedor.autorizar()
-            tokens.guardar(proveedor.nombre, refresh)
+            proveedor.tokens.guardar(proveedor.nombre, refresh)
             log.info("Cuenta de %s vinculada. El permiso se guardó en %s.", proveedor.titulo, conf.archivo_tokens)
             log.info("%s", proveedor.probar())
             return 0
@@ -1244,7 +1910,7 @@ def main(argv=None):
             log.info("%s", proveedor.probar())
             log.info("Conexión correcta con %s.", proveedor.descripcion_destino())
             return 0
-        return subir_con_bloqueo(conf, proveedor, args.simular)
+        return subir_con_bloqueo(conf, proveedor, args.simular, args.origen)
     except ErrorFatal as e:
         log.error("%s", e)
         return 2
@@ -1258,8 +1924,8 @@ def main(argv=None):
         log.exception("Error inesperado")
         return 3
     finally:
-        if http is not None:
-            http.cerrar()
+        if proveedor is not None:
+            proveedor.http.cerrar()
 
 
 if __name__ == "__main__":

@@ -4,3 +4,7 @@
 *.sql text eol=crlf
 *.py  text eol=crlf
 *.md  text eol=crlf
+*.iss text eol=crlf
+*.pyw text eol=crlf
+*.sh  text eol=lf
+*.ico binary

@@ -118,6 +118,26 @@ class BasePrueba(unittest.TestCase):
         with open(ruta, encoding="utf-8") as f:
             return json.load(f)["archivos"]
 
+    def sesiones(self):
+        return subir_nube.leer_json(os.path.join(self.dir, "estado.json")).get("sesiones", {})
+
+    def historial(self, tipo):
+        entradas = subir_nube.Historial.leer(os.path.join(self.dir, "historial.jsonl"))
+        return [e for e in entradas if e["tipo"] == tipo]
+
+    def actividad(self):
+        return subir_nube.leer_actividad(os.path.join(self.dir, "actividad.json"))
+
+    def detener_al_recibir(self, metodo, prefijo, numero):
+        """Simula que el usuario pulsa 'Detener' cuando llega la petición número 'numero'."""
+        solicitud = os.path.join(self.dir, "detener.solicitud")
+
+        def al_recibir(m, ruta):
+            if m == metodo and ruta.startswith(prefijo) and self.nube.contar(metodo, prefijo) == numero:
+                open(solicitud, "w").close()
+        self.nube.al_recibir = al_recibir
+        return solicitud
+
 
 class PruebasHash(unittest.TestCase):
     def test_hash_dropbox_coincide_con_referencia(self):
@@ -141,12 +161,15 @@ class PruebasHash(unittest.TestCase):
             lector.leer(0, 400)
             lector.leer(200, 400)    # reenvío parcial
             lector.leer(600, 400)
-            self.assertTrue(lector.en_orden)
             self.assertEqual(lector.hash_hex(1000), hashlib.md5(datos).hexdigest())
+        latidos = []
+        with subir_nube.LectorArchivo(f.name, hashlib.md5, lambda: latidos.append(1)) as lector:
+            lector.leer(500, 500)    # reanudación: lee la parte anterior solo para la suma
+            self.assertEqual(lector.hasta, 1000)
+            self.assertEqual(lector.hash_hex(1000), hashlib.md5(datos).hexdigest())
+        self.assertTrue(latidos)
         with subir_nube.LectorArchivo(f.name, hashlib.md5) as lector:
-            lector.leer(0, 100)
-            lector.leer(500, 500)    # salto: obliga a releer el archivo completo
-            self.assertFalse(lector.en_orden)
+            lector.leer(0, 100)      # el resto se lee al pedir la suma
             self.assertEqual(lector.hash_hex(1000), hashlib.md5(datos).hexdigest())
 
 
@@ -204,7 +227,7 @@ class PruebasDropbox(BasePrueba):
         self.nube.fallar("POST", "/2/files/upload", estado=429, cabeceras={"Retry-After": "7"},
                          cuerpo={"error_summary": "too_many_write_operations/"})
         self.assertEqual(self.ejecutar(), 0)
-        self.assertEqual(self.esperas, [7])
+        self.assertEqual(sum(self.esperas), 7)  # en pasos cortos, para atender "Detener"
         self.assertIn("/respaldos/sql/a.bak", self.nube.dbx_archivos)
 
     def test_renueva_token_caducado(self):
@@ -300,9 +323,104 @@ class PruebasDropbox(BasePrueba):
         # Solo el respaldo: ni subir_nube.ini, ni tokens.json, ni el registro, ni el estado.
         self.assertEqual(sorted(self.nube.dbx_archivos), ["/respaldos/sql/respaldo.bak"])
 
+    def test_detener_y_reanudar_en_otra_ejecucion(self):
+        datos = datos_aleatorios(6 * MB + 3, 7)
+        self.crear("grande.bak", datos)
+        solicitud = self.detener_al_recibir("POST", "/2/files/upload_session/append_v2", 2)
+        self.assertEqual(self.ejecutar(), 4)
+        self.assertEqual(self.nube.dbx_archivos, {})
+        self.assertFalse(os.path.exists(solicitud))
+        sesion = list(self.sesiones().values())[0]
+        self.assertEqual(sesion["posicion"], 3 * MB)
+        actividad = self.actividad()
+        self.assertFalse(actividad["en_curso"])
+        self.assertEqual(actividad["resultado"], "detenida")
+        self.assertEqual(self.historial("archivo")[-1]["resultado"], "detenido")
+        self.assertEqual(self.historial("ejecucion")[-1]["resultado"], "detenida")
+
+        # La siguiente ejecución continúa la misma sesión desde los 3 MB.
+        self.nube.al_recibir = None
+        self.assertEqual(self.ejecutar(), 0)
+        self.assertEqual(self.nube.dbx_archivos["/respaldos/sql/grande.bak"][1], datos)
+        self.assertEqual(self.nube.contar("POST", "/2/files/upload_session/start"), 1)
+        self.assertEqual(self.nube.contar("POST", "/2/files/upload_session/append_v2"), 5)
+        self.assertEqual(self.sesiones(), {})
+        self.assertTrue(self.historial("archivo")[-1]["verificado"])
+
+    def test_sesion_vencida_empieza_de_nuevo(self):
+        datos = datos_aleatorios(3 * MB, 8)
+        ruta = self.crear("grande.bak", datos, antiguedad=100)
+        info = os.stat(ruta)
+        subir_nube.escribir_json(os.path.join(self.dir, "estado.json"), {"archivos": {}, "sesiones": {
+            "dropbox:/Respaldos/SQL|grande.bak": {"proveedor": "dropbox", "sesion": "vencida", "posicion": MB,
+                                                  "tamano": info.st_size, "mtime": int(info.st_mtime),
+                                                  "creada": time.time()}}})
+        self.assertEqual(self.ejecutar(), 0)
+        self.assertEqual(self.nube.dbx_archivos["/respaldos/sql/grande.bak"][1], datos)
+        self.assertEqual(self.nube.contar("POST", "/2/files/upload_session/start"), 1)
+
+    def test_avance_historial_y_actividad(self):
+        datos = datos_aleatorios(2 * MB + 5, 9)
+        self.crear("a.bak", datos)
+        self.crear("b.bak", b"pequeno")
+        avances = []
+        original = subir_nube.Actividad.avance
+
+        def registrar(actividad, hecho):
+            avances.append(hecho)
+            return original(actividad, hecho)
+        with mock.patch.object(subir_nube.Actividad, "avance", registrar):
+            self.assertEqual(self.ejecutar(), 0)
+        # El avance llega en trozos de 256 KB, no solo al final de cada bloque de 1 MB.
+        self.assertIn(256 * 1024, avances)
+        self.assertEqual(max(avances), len(datos))
+        actividad = self.actividad()
+        self.assertEqual((actividad["resultado"], actividad["cantidad"]), ("correcta", 2))
+        self.assertEqual(actividad["lote_hecho"], actividad["lote_total"])
+        self.assertEqual(actividad["lote_total"], len(datos) + 7)
+        archivos = self.historial("archivo")
+        self.assertEqual([(a["archivo"], a["resultado"], a["verificado"]) for a in archivos],
+                         [("a.bak", "subido", True), ("b.bak", "subido", True)])
+        ejecucion = self.historial("ejecucion")[-1]
+        self.assertEqual((ejecucion["origen"], ejecucion["subidos"], ejecucion["resultado"]),
+                         ("consola", 2, "correcta"))
+
+    def test_error_fatal_queda_en_historial(self):
+        with open(os.path.join(self.dir, "tokens.json"), "w") as f:
+            json.dump({"dropbox": {"refresh_token": "revocado"}}, f)
+        self.crear("a.bak", b"x")
+        self.assertEqual(self.ejecutar("subir", "--origen", "programada"), 2)
+        ejecucion = self.historial("ejecucion")[-1]
+        self.assertEqual((ejecucion["resultado"], ejecucion["origen"]), ("fallida", "programada"))
+        self.assertIn("no renovó el acceso", ejecucion["detalle"])
+        self.assertEqual(self.actividad()["resultado"], "fallida")
+
 
 class PruebasGoogleDrive(BasePrueba):
     proveedor = "gdrive"
+
+    def test_detener_y_reanudar_en_otra_ejecucion(self):
+        datos = datos_aleatorios(4 * MB + 9, 10)
+        self.crear("grande.bak", datos)
+        self.detener_al_recibir("PUT", "/upload/sesion/", 2)
+        self.assertEqual(self.ejecutar(), 4)
+        self.assertEqual(len(self.sesiones()), 1)
+        self.nube.al_recibir = None
+        self.assertEqual(self.ejecutar(), 0)
+        self.assertEqual(self.nube.gd_ruta("Respaldos/SQL/grande.bak")["datos"], datos)
+        self.assertEqual(self.nube.contar("POST", "/upload/drive/v3/files"), 1)  # una sola sesión
+        self.assertEqual(self.sesiones(), {})
+
+    def test_sesion_vencida_empieza_de_nuevo(self):
+        datos = datos_aleatorios(2 * MB, 11)
+        ruta = self.crear("grande.bak", datos, antiguedad=100)
+        info = os.stat(ruta)
+        subir_nube.escribir_json(os.path.join(self.dir, "estado.json"), {"archivos": {}, "sesiones": {
+            "gdrive:/Respaldos/SQL|grande.bak": {"proveedor": "gdrive", "sesion": self.nube.base + "/upload/sesion/x",
+                                                 "tamano": info.st_size, "mtime": int(info.st_mtime),
+                                                 "creada": time.time()}}})
+        self.assertEqual(self.ejecutar(), 0)
+        self.assertEqual(self.nube.gd_ruta("Respaldos/SQL/grande.bak")["datos"], datos)
 
     def test_sube_y_crea_carpetas_una_sola_vez(self):
         self.escribir_ini(recursivo="si")
@@ -392,7 +510,7 @@ class PruebasConfiguracion(unittest.TestCase):
         self.assertTrue(conf.recursivo)
         self.assertEqual(conf.patrones, ["*.bak", "*.trn"])
         self.assertEqual(conf.certificados, "")
-        self.assertEqual(conf.tamano_bloque, 8 * MB)
+        self.assertEqual(conf.tamano_bloque, 16 * MB)
 
     def test_ini_de_ejemplo_es_valido(self):
         raiz = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -406,6 +524,59 @@ class PruebasConfiguracion(unittest.TestCase):
         self.assertFalse(conf.borrar_local)
         with self.assertRaises(subir_nube.ErrorFatal):
             conf.credencial("dropbox", "app_key")  # vacío en el ejemplo
+
+    def test_guardar_configuracion_valida_antes_de_reemplazar(self):
+        ruta = os.path.join(self.dir, "subir_nube.ini")
+        valores = subir_nube.leer_valores(ruta)   # no existe: valores por defecto
+        valores[("general", "origen")] = u"D:\\Respaldos\\Año 2026"
+        valores[("general", "certificados")] = ""
+        valores[("programacion", "activa")] = "si"
+        valores[("programacion", "frecuencia")] = "semanal"
+        valores[("programacion", "dias")] = "LUN,VIE"
+        conf = subir_nube.guardar_configuracion(ruta, valores)
+        self.assertTrue(conf.origen.endswith(u"Año 2026"))
+        self.assertEqual(conf.programacion.dias, ["LUN", "VIE"])
+        self.assertEqual(conf.programacion.descripcion(),
+                         "Los lunes y viernes a las 03:30, con la cuenta SYSTEM.")
+        with open(ruta, "rb") as f:
+            crudo = f.read()
+        self.assertTrue(crudo.startswith(b"\xef\xbb\xbf"))   # BOM: el Bloc de notas de 2003 lo muestra bien
+        self.assertIn(b"\r\n", crudo)
+        self.assertEqual(subir_nube.leer_valores(ruta)[("programacion", "dias")], "LUN,VIE")
+
+        valores[("general", "reintentos")] = "muchos"
+        with self.assertRaises(subir_nube.ErrorFatal):
+            subir_nube.guardar_configuracion(ruta, valores)
+        with open(ruta, "rb") as f:
+            self.assertEqual(f.read(), crudo)     # el archivo anterior queda intacto
+        self.assertFalse(os.path.exists(ruta + ".nuevo"))
+
+    def test_argumentos_de_la_tarea_programada(self):
+        p = subir_nube.Programacion(activa=True, frecuencia="diaria", hora="03:30")
+        comando = '"C:\\Python34\\pythonw.exe" "C:\\SubirNube\\subir_nube.py" subir'
+        antiguo = subir_nube.argumentos_crear_tarea(p, comando, antiguo=True)
+        self.assertEqual(antiguo, ["schtasks", "/create", "/tn", "SubirNube", "/tr", comando,
+                                   "/sc", "daily", "/st", "03:30:00", "/ru", "SYSTEM"])
+        nuevo = subir_nube.argumentos_crear_tarea(p, comando, antiguo=False)
+        self.assertEqual(nuevo[6:], ["/sc", "daily", "/st", "03:30", "/ru", "SYSTEM", "/f"])
+        p = subir_nube.Programacion(activa=True, frecuencia="semanal", hora="22:05", dias=["LUN", "MIE", "DOM"],
+                                    usuario="DOMINIO\\respaldos")
+        semanal = subir_nube.argumentos_crear_tarea(p, comando, antiguo=True, clave="secreta")
+        self.assertIn("MON,WED,SUN", semanal)
+        self.assertEqual(semanal[-4:], ["/ru", "DOMINIO\\respaldos", "/rp", "secreta"])
+        p = subir_nube.Programacion(activa=True, frecuencia="horas", hora="00:00", cada_horas=6)
+        horas = subir_nube.argumentos_crear_tarea(p, comando, antiguo=True)
+        self.assertEqual(horas[6:12], ["/sc", "hourly", "/mo", "6", "/st", "00:00:00"])
+        self.assertIn("--origen programada", subir_nube.comando_tarea(os.path.join(self.dir, "x.ini")))
+
+    def test_programacion_invalida(self):
+        ruta = os.path.join(self.dir, "subir_nube.ini")
+        for linea in ("hora = 25:00", "dias = LUNES", "frecuencia = mensual"):
+            with open(ruta, "w") as f:
+                f.write("[general]\ncertificados =\n[programacion]\nactiva = si\nfrecuencia = semanal\n"
+                        "dias = LUN\n" + linea + "\n")
+            with self.assertRaises(subir_nube.ErrorFatal):
+                subir_nube.Configuracion(ruta)
 
     def test_valor_invalido(self):
         ruta = os.path.join(self.dir, "subir_nube.ini")

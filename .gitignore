@@ -10,3 +10,7 @@ cacert.pem
 
 __pycache__/
 *.pyc
+
+# Instalador: descargas y resultado de la compilación
+instalador/descargas/
+instalador/salida/

@@ -40,6 +40,7 @@ class NubeFalsa(object):
         self.bloqueo = threading.Lock()
         self.peticiones = []          # (metodo, ruta)
         self.fallos = []              # dicts: metodo, ruta (prefijo), estado, veces, despues
+        self.al_recibir = None        # función (metodo, ruta) llamada al recibir cada petición
         self.token_valido = None
         self.tokens_emitidos = 0
         # Dropbox
@@ -83,6 +84,8 @@ class NubeFalsa(object):
         ruta, consulta = partes.path, urllib.parse.parse_qs(partes.query)
         with self.bloqueo:
             self.peticiones.append((h.command, ruta))
+            if self.al_recibir is not None:
+                self.al_recibir(h.command, ruta)
             fallo = None
             for f in self.fallos:
                 if f["veces"] > 0 and f["metodo"] == h.command and ruta.startswith(f["ruta"]):
@@ -167,7 +170,12 @@ class NubeFalsa(object):
             self.dbx_sesiones[sesion] = bytearray(cuerpo)
             return 200, {"session_id": sesion}, None
         cursor = argumento["cursor"]
-        datos = self.dbx_sesiones[cursor["session_id"]]
+        datos = self.dbx_sesiones.get(cursor["session_id"])
+        if datos is None:
+            error = {".tag": "not_found"}
+            if ruta.endswith("finish"):
+                error = {".tag": "lookup_failed", "lookup_failed": error}
+            return 409, {"error_summary": "not_found/", "error": error}, None
         if cursor["offset"] != len(datos):
             error = {".tag": "incorrect_offset", "correct_offset": len(datos)}
             if ruta.endswith("finish"):
@@ -240,7 +248,10 @@ class NubeFalsa(object):
                                         "total": int(h.headers["X-Upload-Content-Length"])}
             return 200, None, {"Location": "{0}/upload/sesion/{1}?upload_id={1}".format(self.base, sesion)}
         if ruta.startswith("/upload/sesion/"):
-            return self._gd_bloque(h, self.gd_sesiones[ruta.rsplit("/", 1)[1]], cuerpo)
+            sesion = self.gd_sesiones.get(ruta.rsplit("/", 1)[1])
+            if sesion is None:
+                return 404, {"error": {"code": 404, "message": "No such upload"}}, None
+            return self._gd_bloque(h, sesion, cuerpo)
         return 404, {"error": {"code": 404, "message": "ruta desconocida " + ruta}}, None
 
     def _gd_bloque(self, h, sesion, cuerpo):
