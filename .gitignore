@@ -1,5 +1,5 @@
 # Configuración y datos locales de cada servidor (contienen credenciales)
-subir_nube.ini
+carontesync.ini
 tokens.json
 estado.json
 *.tmp

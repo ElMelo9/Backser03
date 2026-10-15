@@ -1,5 +1,5 @@
 @echo off
-rem Construye instalador\salida\SubirNube-2.0-instalador.exe en un equipo con
+rem Construye instalador\salida\CaronteSync-3.0-instalador.exe en un equipo con
 rem Windows 7 o posterior (no en el servidor 2003: este no puede descargar por HTTPS).
 rem Requiere Inno Setup 5.6.1: https://files.jrsoftware.org/is/5/innosetup-5.6.1-unicode.exe
 
@@ -20,7 +20,7 @@ if not exist "%ISCC%" (
     echo No se encuentra Inno Setup 5. Instale innosetup-5.6.1-unicode.exe.
     goto error
 )
-"%ISCC%" subir_nube.iss || goto error
+"%ISCC%" carontesync.iss || goto error
 echo.
 echo Listo: %~dp0salida
 exit /b 0

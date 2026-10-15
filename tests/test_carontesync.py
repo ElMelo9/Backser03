@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Pruebas de subir_nube.py contra un servidor falso de Dropbox y Google Drive.
+"""Pruebas de carontesync.py contra un servidor falso de Dropbox y Google Drive.
 
 Ejecutar desde la carpeta del proyecto:  python -m unittest discover -s tests -v
 """
@@ -11,13 +11,14 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import subir_nube  # noqa: E402
+import carontesync  # noqa: E402
 from tests.nube_falsa import MB, NubeFalsa, hash_dropbox  # noqa: E402
 
 INI = u"""[general]
@@ -59,7 +60,7 @@ class BasePrueba(unittest.TestCase):
     proveedor = "dropbox"
 
     def setUp(self):
-        self.dir = tempfile.mkdtemp(prefix="subir_nube_")
+        self.dir = tempfile.mkdtemp(prefix="carontesync_")
         self.addCleanup(shutil.rmtree, self.dir, True)
         self.origen = os.path.join(self.dir, "origen")
         os.makedirs(self.origen)
@@ -67,25 +68,25 @@ class BasePrueba(unittest.TestCase):
         self.addCleanup(self.nube.cerrar)
         base = self.nube.base
         for clase, atributo, valor in (
-                (subir_nube.Dropbox, "URL_TOKEN", base + "/oauth2/token"),
-                (subir_nube.Dropbox, "URL_API", base + "/2"),
-                (subir_nube.Dropbox, "URL_CONTENIDO", base + "/2"),
-                (subir_nube.GoogleDrive, "URL_TOKEN", base + "/token"),
-                (subir_nube.GoogleDrive, "URL_DISPOSITIVO", base + "/device/code"),
-                (subir_nube.GoogleDrive, "URL_API", base + "/drive/v3"),
-                (subir_nube.GoogleDrive, "URL_SUBIDA", base + "/upload/drive/v3")):
+                (carontesync.Dropbox, "URL_TOKEN", base + "/oauth2/token"),
+                (carontesync.Dropbox, "URL_API", base + "/2"),
+                (carontesync.Dropbox, "URL_CONTENIDO", base + "/2"),
+                (carontesync.GoogleDrive, "URL_TOKEN", base + "/token"),
+                (carontesync.GoogleDrive, "URL_DISPOSITIVO", base + "/device/code"),
+                (carontesync.GoogleDrive, "URL_API", base + "/drive/v3"),
+                (carontesync.GoogleDrive, "URL_SUBIDA", base + "/upload/drive/v3")):
             parche = mock.patch.object(clase, atributo, valor)
             parche.start()
             self.addCleanup(parche.stop)
         self.esperas = []
-        parche = mock.patch.object(subir_nube, "_dormir", self.esperas.append)
+        parche = mock.patch.object(carontesync, "_dormir", self.esperas.append)
         parche.start()
         self.addCleanup(parche.stop)
         self.escribir_ini()
         self.guardar_token()
 
     def escribir_ini(self, recursivo="no", borrar="no", extra=""):
-        self.ini = os.path.join(self.dir, "subir_nube.ini")
+        self.ini = os.path.join(self.dir, "carontesync.ini")
         texto = INI.format(proveedor=self.proveedor, recursivo=recursivo, borrar=borrar) + extra
         with open(self.ini, "w", encoding="utf-8") as f:
             f.write(texto)
@@ -107,8 +108,8 @@ class BasePrueba(unittest.TestCase):
         return ruta
 
     def ejecutar(self, *args):
-        codigo = subir_nube.main(["-c", self.ini] + list(args))
-        subir_nube.configurar_registro(False)  # cierra el archivo de registro
+        codigo = carontesync.main(["-c", self.ini] + list(args))
+        carontesync.configurar_registro(False)  # cierra el archivo de registro
         return codigo
 
     def estado(self):
@@ -119,14 +120,14 @@ class BasePrueba(unittest.TestCase):
             return json.load(f)["archivos"]
 
     def sesiones(self):
-        return subir_nube.leer_json(os.path.join(self.dir, "estado.json")).get("sesiones", {})
+        return carontesync.leer_json(os.path.join(self.dir, "estado.json")).get("sesiones", {})
 
     def historial(self, tipo):
-        entradas = subir_nube.Historial.leer(os.path.join(self.dir, "historial.jsonl"))
+        entradas = carontesync.Historial.leer(os.path.join(self.dir, "historial.jsonl"))
         return [e for e in entradas if e["tipo"] == tipo]
 
     def actividad(self):
-        return subir_nube.leer_actividad(os.path.join(self.dir, "actividad.json"))
+        return carontesync.leer_actividad(os.path.join(self.dir, "actividad.json"))
 
     def detener_al_recibir(self, metodo, prefijo, numero):
         """Simula que el usuario pulsa 'Detener' cuando llega la petición número 'numero'."""
@@ -143,7 +144,7 @@ class PruebasHash(unittest.TestCase):
     def test_hash_dropbox_coincide_con_referencia(self):
         for tamano in (0, 1, 4 * MB - 1, 4 * MB, 4 * MB + 1, 9 * MB + 123):
             datos = datos_aleatorios(tamano)
-            calculador = subir_nube.HashDropbox()
+            calculador = carontesync.HashDropbox()
             # Trozos de tamaños irregulares para cruzar los límites de bloque.
             posicion, paso = 0, 1
             while posicion < tamano:
@@ -152,25 +153,84 @@ class PruebasHash(unittest.TestCase):
                 paso = paso * 7 % (3 * MB) + 1
             self.assertEqual(calculador.hexdigest(), hash_dropbox(datos), tamano)
 
-    def test_lector_calcula_hash_aunque_se_reenvien_trozos(self):
-        datos = datos_aleatorios(1000)
+    def archivo(self, datos):
         with tempfile.NamedTemporaryFile(delete=False) as f:
             f.write(datos)
         self.addCleanup(os.remove, f.name)
-        with subir_nube.LectorArchivo(f.name, hashlib.md5) as lector:
-            lector.leer(0, 400)
-            lector.leer(200, 400)    # reenvío parcial
-            lector.leer(600, 400)
-            self.assertEqual(lector.hash_hex(1000), hashlib.md5(datos).hexdigest())
+        return f.name
+
+    def test_lector_secuencial_usa_los_bloques_preparados(self):
+        datos = datos_aleatorios(10 * 1000 + 7)
+        ruta = self.archivo(datos)
+        with carontesync.LectorArchivo(ruta, hashlib.md5, len(datos), 1000) as lector:
+            with mock.patch.object(lector._directo, "read", side_effect=AssertionError("lectura directa")):
+                for posicion in range(0, len(datos), 1000):
+                    cantidad = min(1000, len(datos) - posicion)
+                    self.assertEqual(lector.leer(posicion, cantidad), datos[posicion:posicion + cantidad])
+            self.assertEqual(lector.hash_hex(), hashlib.md5(datos).hexdigest())
+
+    def test_lector_reenvios_saltos_y_posiciones_desalineadas(self):
+        datos = datos_aleatorios(10000)
+        ruta = self.archivo(datos)
+        with carontesync.LectorArchivo(ruta, hashlib.md5, 10000, 1000) as lector:
+            self.assertEqual(lector.leer(0, 1000), datos[:1000])
+            self.assertEqual(lector.leer(500, 1000), datos[500:1500])      # reenvío parcial
+            self.assertEqual(lector.leer(7000, 1000), datos[7000:8000])    # salto (reanudación)
+            self.assertEqual(lector.leer(7333, 500), datos[7333:7833])     # desalineada
+            self.assertEqual(lector.leer(9000, 1000), datos[9000:])
+            self.assertEqual(lector.hash_hex(), hashlib.md5(datos).hexdigest())
+
+    def test_lector_reanuda_al_final_y_la_suma_cubre_todo_el_archivo(self):
+        datos = datos_aleatorios(5 * MB + 3)
+        ruta = self.archivo(datos)
         latidos = []
-        with subir_nube.LectorArchivo(f.name, hashlib.md5, lambda: latidos.append(1)) as lector:
-            lector.leer(500, 500)    # reanudación: lee la parte anterior solo para la suma
-            self.assertEqual(lector.hasta, 1000)
-            self.assertEqual(lector.hash_hex(1000), hashlib.md5(datos).hexdigest())
-        self.assertTrue(latidos)
-        with subir_nube.LectorArchivo(f.name, hashlib.md5) as lector:
-            lector.leer(0, 100)      # el resto se lee al pedir la suma
-            self.assertEqual(lector.hash_hex(1000), hashlib.md5(datos).hexdigest())
+        with carontesync.LectorArchivo(ruta, carontesync.HashDropbox, len(datos), MB,
+                                       lambda: latidos.append(1)) as lector:
+            self.assertEqual(lector.leer(5 * MB, 3), datos[-3:])
+            self.assertEqual(lector.hash_hex(), hash_dropbox(datos))
+
+    def test_lector_archivo_vacio(self):
+        ruta = self.archivo(b"")
+        with carontesync.LectorArchivo(ruta, hashlib.md5, 0, MB) as lector:
+            self.assertEqual(lector.leer(0, 0), b"")
+            self.assertEqual(lector.hash_hex(), hashlib.md5(b"").hexdigest())
+
+    def test_lector_archivo_que_se_acorta(self):
+        datos = datos_aleatorios(3000)
+        ruta = self.archivo(datos)
+        with carontesync.LectorArchivo(ruta, hashlib.md5, 5000, 1000) as lector:   # dice 5000, tiene 3000
+            lector.leer(0, 1000)
+            with self.assertRaises(carontesync.ErrorNube):
+                lector.leer(4000, 1000)
+            with self.assertRaises(carontesync.ErrorNube):
+                lector.hash_hex()
+
+    def test_lector_detenido_mientras_espera(self):
+        ruta = self.archivo(datos_aleatorios(4000))
+        liberar = threading.Event()
+
+        class HashLento(object):
+            """Retiene al hilo lector, como un disco o una CPU muy lentos."""
+            def __init__(self):
+                self.h = hashlib.md5()
+
+            def update(self, datos):
+                liberar.wait(10)
+                self.h.update(datos)
+
+            def hexdigest(self):
+                return self.h.hexdigest()
+
+        def latido():
+            raise carontesync.Detenido()
+        lector = carontesync.LectorArchivo(ruta, HashLento, 4000, 1000, latido)
+        try:
+            with self.assertRaises(carontesync.Detenido):
+                lector.leer(1000, 1000)    # espera al hilo; el latido atiende "Detener"
+        finally:
+            liberar.set()
+            lector.cerrar()
+        self.assertFalse(lector._hilo.is_alive())
 
 
 class PruebasDropbox(BasePrueba):
@@ -304,7 +364,7 @@ class PruebasDropbox(BasePrueba):
     def test_no_borra_si_la_suma_no_coincide(self):
         self.escribir_ini(borrar="si")
         ruta = self.crear("a.bak", b"contenido")
-        with mock.patch.object(subir_nube.HashDropbox, "hexdigest", return_value="0" * 64):
+        with mock.patch.object(carontesync.HashDropbox, "hexdigest", return_value="0" * 64):
             self.assertEqual(self.ejecutar(), 1)
         self.assertTrue(os.path.exists(ruta))
         self.assertEqual(self.estado(), {})
@@ -320,7 +380,7 @@ class PruebasDropbox(BasePrueba):
             f.write(b"x")
         self.assertEqual(self.ejecutar(), 0)
         self.assertEqual(self.ejecutar(), 0)  # ahora ya existen estado.json y el registro
-        # Solo el respaldo: ni subir_nube.ini, ni tokens.json, ni el registro, ni el estado.
+        # Solo el respaldo: ni carontesync.ini, ni tokens.json, ni el registro, ni el estado.
         self.assertEqual(sorted(self.nube.dbx_archivos), ["/respaldos/sql/respaldo.bak"])
 
     def test_detener_y_reanudar_en_otra_ejecucion(self):
@@ -351,7 +411,7 @@ class PruebasDropbox(BasePrueba):
         datos = datos_aleatorios(3 * MB, 8)
         ruta = self.crear("grande.bak", datos, antiguedad=100)
         info = os.stat(ruta)
-        subir_nube.escribir_json(os.path.join(self.dir, "estado.json"), {"archivos": {}, "sesiones": {
+        carontesync.escribir_json(os.path.join(self.dir, "estado.json"), {"archivos": {}, "sesiones": {
             "dropbox:/Respaldos/SQL|grande.bak": {"proveedor": "dropbox", "sesion": "vencida", "posicion": MB,
                                                   "tamano": info.st_size, "mtime": int(info.st_mtime),
                                                   "creada": time.time()}}})
@@ -364,12 +424,12 @@ class PruebasDropbox(BasePrueba):
         self.crear("a.bak", datos)
         self.crear("b.bak", b"pequeno")
         avances = []
-        original = subir_nube.Actividad.avance
+        original = carontesync.Actividad.avance
 
         def registrar(actividad, hecho):
             avances.append(hecho)
             return original(actividad, hecho)
-        with mock.patch.object(subir_nube.Actividad, "avance", registrar):
+        with mock.patch.object(carontesync.Actividad, "avance", registrar):
             self.assertEqual(self.ejecutar(), 0)
         # El avance llega en trozos de 256 KB, no solo al final de cada bloque de 1 MB.
         self.assertIn(256 * 1024, avances)
@@ -415,7 +475,7 @@ class PruebasGoogleDrive(BasePrueba):
         datos = datos_aleatorios(2 * MB, 11)
         ruta = self.crear("grande.bak", datos, antiguedad=100)
         info = os.stat(ruta)
-        subir_nube.escribir_json(os.path.join(self.dir, "estado.json"), {"archivos": {}, "sesiones": {
+        carontesync.escribir_json(os.path.join(self.dir, "estado.json"), {"archivos": {}, "sesiones": {
             "gdrive:/Respaldos/SQL|grande.bak": {"proveedor": "gdrive", "sesion": self.nube.base + "/upload/sesion/x",
                                                  "tamano": info.st_size, "mtime": int(info.st_mtime),
                                                  "creada": time.time()}}})
@@ -495,45 +555,45 @@ class PruebasGoogleDrive(BasePrueba):
 
 class PruebasConfiguracion(unittest.TestCase):
     def setUp(self):
-        self.dir = tempfile.mkdtemp(prefix="subir_nube_")
+        self.dir = tempfile.mkdtemp(prefix="carontesync_")
         self.addCleanup(shutil.rmtree, self.dir, True)
 
     def test_ini_en_ansi_con_comillas_y_acentos(self):
-        ruta = os.path.join(self.dir, "subir_nube.ini")
+        ruta = os.path.join(self.dir, "carontesync.ini")
         texto = (u'[general]\r\nproveedor = Google Drive\r\norigen = "D:\\Copias de Año"\r\n'
                  u"recursivo = Sí\r\npatrones = *.bak,*.trn\r\ncertificados =\r\n")
         with open(ruta, "wb") as f:
             f.write(texto.encode("cp1252"))
-        conf = subir_nube.Configuracion(ruta)
+        conf = carontesync.Configuracion(ruta)
         self.assertEqual(conf.proveedor, "gdrive")
         self.assertTrue(conf.origen.endswith(u"Copias de Año"))
         self.assertTrue(conf.recursivo)
         self.assertEqual(conf.patrones, ["*.bak", "*.trn"])
         self.assertEqual(conf.certificados, "")
-        self.assertEqual(conf.tamano_bloque, 16 * MB)
+        self.assertEqual(conf.tamano_bloque, 32 * MB)
 
     def test_ini_de_ejemplo_es_valido(self):
         raiz = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        ruta = os.path.join(self.dir, "subir_nube.ini")
-        shutil.copy(os.path.join(raiz, "subir_nube.ejemplo.ini"), ruta)
+        ruta = os.path.join(self.dir, "carontesync.ini")
+        shutil.copy(os.path.join(raiz, "carontesync.ejemplo.ini"), ruta)
         open(os.path.join(self.dir, "cacert.pem"), "w").close()
-        conf = subir_nube.Configuracion(ruta)
+        conf = carontesync.Configuracion(ruta)
         self.assertEqual(conf.proveedor, "dropbox")
         self.assertEqual(conf.patrones, ["*.bak", "*.trn"])
         self.assertEqual(conf.antiguedad_minima, 600)
         self.assertFalse(conf.borrar_local)
-        with self.assertRaises(subir_nube.ErrorFatal):
+        with self.assertRaises(carontesync.ErrorFatal):
             conf.credencial("dropbox", "app_key")  # vacío en el ejemplo
 
     def test_guardar_configuracion_valida_antes_de_reemplazar(self):
-        ruta = os.path.join(self.dir, "subir_nube.ini")
-        valores = subir_nube.leer_valores(ruta)   # no existe: valores por defecto
+        ruta = os.path.join(self.dir, "carontesync.ini")
+        valores = carontesync.leer_valores(ruta)   # no existe: valores por defecto
         valores[("general", "origen")] = u"D:\\Respaldos\\Año 2026"
         valores[("general", "certificados")] = ""
         valores[("programacion", "activa")] = "si"
         valores[("programacion", "frecuencia")] = "semanal"
         valores[("programacion", "dias")] = "LUN,VIE"
-        conf = subir_nube.guardar_configuracion(ruta, valores)
+        conf = carontesync.guardar_configuracion(ruta, valores)
         self.assertTrue(conf.origen.endswith(u"Año 2026"))
         self.assertEqual(conf.programacion.dias, ["LUN", "VIE"])
         self.assertEqual(conf.programacion.descripcion(),
@@ -542,71 +602,78 @@ class PruebasConfiguracion(unittest.TestCase):
             crudo = f.read()
         self.assertTrue(crudo.startswith(b"\xef\xbb\xbf"))   # BOM: el Bloc de notas de 2003 lo muestra bien
         self.assertIn(b"\r\n", crudo)
-        self.assertEqual(subir_nube.leer_valores(ruta)[("programacion", "dias")], "LUN,VIE")
+        self.assertEqual(carontesync.leer_valores(ruta)[("programacion", "dias")], "LUN,VIE")
 
         valores[("general", "reintentos")] = "muchos"
-        with self.assertRaises(subir_nube.ErrorFatal):
-            subir_nube.guardar_configuracion(ruta, valores)
+        with self.assertRaises(carontesync.ErrorFatal):
+            carontesync.guardar_configuracion(ruta, valores)
         with open(ruta, "rb") as f:
             self.assertEqual(f.read(), crudo)     # el archivo anterior queda intacto
         self.assertFalse(os.path.exists(ruta + ".nuevo"))
 
     def test_argumentos_de_la_tarea_programada(self):
-        p = subir_nube.Programacion(activa=True, frecuencia="diaria", hora="03:30")
-        comando = '"C:\\Python34\\pythonw.exe" "C:\\SubirNube\\subir_nube.py" subir'
-        antiguo = subir_nube.argumentos_crear_tarea(p, comando, antiguo=True)
-        self.assertEqual(antiguo, ["schtasks", "/create", "/tn", "SubirNube", "/tr", comando,
+        p = carontesync.Programacion(activa=True, frecuencia="diaria", hora="03:30")
+        comando = '"C:\\Python34\\pythonw.exe" "C:\\CaronteSync\\carontesync.py" subir'
+        antiguo = carontesync.argumentos_crear_tarea(p, comando, antiguo=True)
+        self.assertEqual(antiguo, ["schtasks", "/create", "/tn", "CaronteSync", "/tr", comando,
                                    "/sc", "daily", "/st", "03:30:00", "/ru", "SYSTEM"])
-        nuevo = subir_nube.argumentos_crear_tarea(p, comando, antiguo=False)
+        nuevo = carontesync.argumentos_crear_tarea(p, comando, antiguo=False)
         self.assertEqual(nuevo[6:], ["/sc", "daily", "/st", "03:30", "/ru", "SYSTEM", "/f"])
-        p = subir_nube.Programacion(activa=True, frecuencia="semanal", hora="22:05", dias=["LUN", "MIE", "DOM"],
-                                    usuario="DOMINIO\\respaldos")
-        semanal = subir_nube.argumentos_crear_tarea(p, comando, antiguo=True, clave="secreta")
+        p = carontesync.Programacion(activa=True, frecuencia="semanal", hora="22:05", dias=["LUN", "MIE", "DOM"],
+                                     usuario="DOMINIO\\respaldos")
+        semanal = carontesync.argumentos_crear_tarea(p, comando, antiguo=True, clave="secreta")
         self.assertIn("MON,WED,SUN", semanal)
         self.assertEqual(semanal[-4:], ["/ru", "DOMINIO\\respaldos", "/rp", "secreta"])
-        p = subir_nube.Programacion(activa=True, frecuencia="horas", hora="00:00", cada_horas=6)
-        horas = subir_nube.argumentos_crear_tarea(p, comando, antiguo=True)
+        p = carontesync.Programacion(activa=True, frecuencia="horas", hora="00:00", cada_horas=6)
+        horas = carontesync.argumentos_crear_tarea(p, comando, antiguo=True)
         self.assertEqual(horas[6:12], ["/sc", "hourly", "/mo", "6", "/st", "00:00:00"])
-        self.assertIn("--origen programada", subir_nube.comando_tarea(os.path.join(self.dir, "x.ini")))
+        self.assertIn("--origen programada", carontesync.comando_tarea(os.path.join(self.dir, "x.ini")))
 
     def test_programacion_invalida(self):
-        ruta = os.path.join(self.dir, "subir_nube.ini")
+        ruta = os.path.join(self.dir, "carontesync.ini")
         for linea in ("hora = 25:00", "dias = LUNES", "frecuencia = mensual"):
             with open(ruta, "w") as f:
                 f.write("[general]\ncertificados =\n[programacion]\nactiva = si\nfrecuencia = semanal\n"
                         "dias = LUN\n" + linea + "\n")
-            with self.assertRaises(subir_nube.ErrorFatal):
-                subir_nube.Configuracion(ruta)
+            with self.assertRaises(carontesync.ErrorFatal):
+                carontesync.Configuracion(ruta)
+
+    def test_ini_guardado_como_unicode_en_el_bloc_de_notas(self):
+        ruta = os.path.join(self.dir, "carontesync.ini")
+        texto = u"[general]\r\norigen = D:\\Respaldos\\Año\r\ncertificados =\r\n"
+        with open(ruta, "wb") as f:
+            f.write(texto.encode("utf-16"))     # "Unicode" del Bloc de notas: UTF-16 con BOM
+        self.assertTrue(carontesync.Configuracion(ruta).origen.endswith(u"Año"))
 
     def test_valor_invalido(self):
-        ruta = os.path.join(self.dir, "subir_nube.ini")
+        ruta = os.path.join(self.dir, "carontesync.ini")
         with open(ruta, "w") as f:
             f.write("[general]\nproveedor = dropbox\nreintentos = muchos\ncertificados =\n")
-        with self.assertRaises(subir_nube.ErrorFatal):
-            subir_nube.Configuracion(ruta)
+        with self.assertRaises(carontesync.ErrorFatal):
+            carontesync.Configuracion(ruta)
 
     def test_falta_cacert(self):
-        ruta = os.path.join(self.dir, "subir_nube.ini")
+        ruta = os.path.join(self.dir, "carontesync.ini")
         with open(ruta, "w") as f:
             f.write("[general]\nproveedor = dropbox\n")
-        with self.assertRaises(subir_nube.ErrorFatal) as error:
-            subir_nube.Configuracion(ruta)
+        with self.assertRaises(carontesync.ErrorFatal) as error:
+            carontesync.Configuracion(ruta)
         self.assertIn("curl.se", str(error.exception))
 
     def test_proxy(self):
-        self.assertIsNone(subir_nube.analizar_proxy(""))
-        host, puerto, cabeceras = subir_nube.analizar_proxy("http://ana:cl%40ve@proxy.local:3128")
+        self.assertIsNone(carontesync.analizar_proxy(""))
+        host, puerto, cabeceras = carontesync.analizar_proxy("http://ana:cl%40ve@proxy.local:3128")
         self.assertEqual((host, puerto), ("proxy.local", 3128))
         self.assertEqual(cabeceras["Proxy-Authorization"], "Basic YW5hOmNsQHZl")
-        self.assertEqual(subir_nube.analizar_proxy("10.0.0.1:8080")[:2], ("10.0.0.1", 8080))
+        self.assertEqual(carontesync.analizar_proxy("10.0.0.1:8080")[:2], ("10.0.0.1", 8080))
 
     def test_bloqueo_impide_dos_ejecuciones(self):
         ruta = os.path.join(self.dir, "estado.json.lock")
-        primero = subir_nube.Bloqueo(ruta)
+        primero = carontesync.Bloqueo(ruta)
         self.assertTrue(primero.adquirir())
-        self.assertFalse(subir_nube.Bloqueo(ruta).adquirir())
+        self.assertFalse(carontesync.Bloqueo(ruta).adquirir())
         primero.liberar()
-        segundo = subir_nube.Bloqueo(ruta)
+        segundo = carontesync.Bloqueo(ruta)
         self.assertTrue(segundo.adquirir())
         segundo.liberar()
 

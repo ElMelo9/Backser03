@@ -1,19 +1,24 @@
-﻿# SubirNube: respaldos de SQL Server a la nube desde Windows Server 2003
+﻿# CaronteSync: respaldos de SQL Server a la nube desde Windows Server 2003
 
-SubirNube es una aplicación de escritorio que copia los archivos de una carpeta del
+> En la mitología griega, Caronte es el barquero que cruza las almas de un mundo a otro.
+> CaronteSync hace lo mismo con sus respaldos: los cruza desde el servidor hacia la nube.
+
+CaronteSync es una aplicación de escritorio que copia los archivos de una carpeta del
 servidor a **Dropbox** o **Google Drive**. Está pensada para los respaldos `.bak`/`.trn`
 de SQL Server, incluidos archivos grandes de 15 GB o más.
 
-- **Se instala** con un instalador: `SubirNube-2.0-instalador.exe`.
-- **Tiene una ventana** con cuatro pestañas:
+- **Se instala** con un instalador: `CaronteSync-3.0-instalador.exe`.
+- **Tiene una ventana** con un menú lateral de cuatro secciones:
 
-  | Pestaña | Para qué sirve |
+  | Sección | Para qué sirve |
   |---|---|
-  | Estado | Barra de progreso, velocidad, tiempo restante, botones *Subir ahora* y *Detener*, registro en vivo |
+  | Estado | Porcentaje, barra de progreso, velocidad, tiempo restante, *Subir ahora* y *Detener*, registro en vivo |
   | Configuración | Todos los parámetros |
   | Programación | Tarea de Windows que sube automáticamente |
   | Historial | Ejecuciones y archivos subidos |
 
+- **Vive junto al reloj, como Dropbox.** Al cerrar la ventana queda un icono en el área de
+  notificación (ver [Junto al reloj](#junto-al-reloj)).
 - **Funciona en Windows Server 2003** (y en XP, 2008, 7 y posteriores).
 
 ## Por qué funciona en Windows 2003
@@ -22,13 +27,13 @@ Dropbox y Google solo aceptan conexiones **TLS 1.2**, que Windows Server 2003 no
 Por eso no sirve nada que use la conexión segura de Windows: Internet Explorer, .NET,
 PowerShell.
 
-SubirNube funciona con **Python 3.4.4**, la última versión de Python que se instala en
+CaronteSync funciona con **Python 3.4.4**, la última versión de Python que se instala en
 Windows XP/2003. Python 3.4.4 trae su propio OpenSSL con TLS 1.2, y el instalador de
-SubirNube lo instala si falta.
+CaronteSync lo instala si falta.
 
 ## Qué hace con un respaldo de 15 GB
 
-- **Lo envía por bloques** (16 MB por defecto). Si se corta la red, reintenta y continúa
+- **Lo envía por bloques** (32 MB por defecto). Si se corta la red, reintenta y continúa
   desde el último bloque recibido.
 - **Puede continuar en otra ejecución.** Si el servidor se reinicia o usted pulsa
   *Detener* a mitad de un archivo, la próxima ejecución sigue desde donde quedó, sin
@@ -41,6 +46,24 @@ SubirNube lo instala si falta.
 - **Recuerda lo que ya subió** y en cada ejecución solo sube lo nuevo o lo modificado.
 - **Borrado local opcional**: puede borrar el archivo del disco local, pero solo después
   de verificar la copia en la nube.
+
+### Qué lo hace más rápido
+
+- **Búferes de red grandes.** Windows 2003 usa por defecto un búfer de envío de 8 KB y, si
+  el programa no lo pide, no activa la escala de ventana TCP. Eso limita cada conexión a
+  unos 64 KB por viaje de ida y vuelta al servidor: con 150 ms de distancia, menos de
+  3,5 Mbps aunque la línea dé más. CaronteSync pide búferes de 4 MB *antes* de conectar,
+  que es lo que hace que Windows active la escala de ventana.
+- **Disco, suma y red trabajan a la vez.** Mientras la red envía un bloque, otro hilo lee
+  el siguiente del disco y calcula su suma de verificación. En un servidor viejo, leer y
+  calcular la suma de 15 GB lleva varios minutos que así quedan ocultos detrás del envío.
+- **Bloques de 32 MB.** Tras cada bloque, Dropbox o Google confirman la recepción, y esa
+  espera se paga una vez por bloque. Con bloques más grandes hay menos esperas: en una
+  prueba con 300 ms de confirmación y un enlace de 100 Mbps, el mismo archivo tardó un
+  10 % menos que con bloques de 16 MB.
+
+Si la subida sigue lenta, mire la velocidad en *Estado* y compárela con la velocidad de
+subida contratada.
 
 ### Antes de empezar: espacio y tiempo
 
@@ -66,20 +89,20 @@ mucho menor que la de bajada (sin contar otros usos de la red):
 | 50 Mbps | 43 min |
 | 100 Mbps | 21 min |
 
-Programe la subida de noche, después de que terminen los respaldos. La pestaña *Estado*
+Programe la subida de noche, después de que terminen los respaldos. La sección *Estado*
 muestra la velocidad real y el tiempo restante.
 
 ## Instalación
 
-1. En un equipo moderno, obtenga `SubirNube-2.0-instalador.exe` (vea
+1. En un equipo moderno, obtenga `CaronteSync-3.0-instalador.exe` (vea
    [Construir el instalador](#construir-el-instalador)). Cópielo al servidor con un
    pendrive o una carpeta compartida: el servidor 2003 no puede descargar desde Internet
    por HTTPS.
 2. En el servidor, ejecute el instalador con una cuenta de administrador. El instalador:
    - instala Python 3.4.4 en `C:\Python34` si no está instalado;
-   - instala SubirNube en `C:\SubirNube`;
+   - instala CaronteSync en `C:\CaronteSync`;
    - crea los accesos directos en el menú Inicio y, si lo elige, en el escritorio.
-3. Al terminar se abre la ventana en la pestaña **Configuración**.
+3. Al terminar se abre la ventana en la sección **Configuración**.
 
 Para desinstalar, use *Agregar o quitar programas*. Al desinstalar:
 - se quita la tarea programada;
@@ -96,8 +119,8 @@ Para desinstalar, use *Agregar o quitar programas*. Al desinstalar:
 2. Elija **Scoped access**. En el tipo de acceso, **App folder** es lo recomendado: el
    programa solo ve su propia carpeta `/Aplicaciones/<nombre de la app>`.
 3. En la pestaña **Permissions**, marque `files.content.write` y pulse **Submit**.
-4. En la pestaña **Settings**, copie **App key** y **App secret** a la pestaña
-   *Configuración* de SubirNube.
+4. En la pestaña **Settings**, copie **App key** y **App secret** a la sección
+   *Configuración* de CaronteSync.
 
 #### Google Drive
 
@@ -108,12 +131,12 @@ Para desinstalar, use *Agregar o quitar programas*. Al desinstalar:
    - **Publique la app** (*En producción*). Mientras esté en modo *Prueba*, Google vence
      el permiso a los 7 días y las subidas dejan de funcionar.
 4. En **Credenciales**, vaya a **Crear credenciales → ID de cliente de OAuth** y elija el
-   tipo **TVs y dispositivos de entrada limitada**. Copie el ID y el secreto a SubirNube.
+   tipo **TVs y dispositivos de entrada limitada**. Copie el ID y el secreto a CaronteSync.
 
-SubirNube solo pide el permiso `drive.file`: ve únicamente los archivos y carpetas que
+CaronteSync solo pide el permiso `drive.file`: ve únicamente los archivos y carpetas que
 crea él mismo, no el resto de su Drive.
 
-### 2. Completar la pestaña Configuración
+### 2. Completar la sección Configuración
 
 - **Carpeta de origen**: donde SQL Server deja los respaldos (botón *Examinar...*).
 - **Archivos**: por ejemplo `*.bak;*.trn`.
@@ -135,12 +158,12 @@ Pulse **Vincular cuenta...**. No hace falta un navegador moderno en el servidor:
 
 Luego pulse **Probar conexión**: muestra la cuenta y el espacio usado.
 
-El permiso queda en `C:\SubirNube\tokens.json`. **Ese archivo da acceso a la cuenta en la
+El permiso queda en `C:\CaronteSync\tokens.json`. **Ese archivo da acceso a la cuenta en la
 nube**: no lo comparta.
 
 ### 4. Programar la subida automática
 
-En la pestaña **Programación**:
+En la sección **Programación**:
 
 1. Marque *Subir automáticamente*.
 2. Elija la frecuencia: todos los días, algunos días de la semana, o cada N horas (útil
@@ -148,16 +171,39 @@ En la pestaña **Programación**:
 3. Elija la hora.
 4. Pulse **Aplicar programación**.
 
-Esto crea la tarea `SubirNube` en el Programador de tareas de Windows. La tarea:
+Esto crea la tarea `CaronteSync` en el Programador de tareas de Windows. La tarea:
 - se ejecuta aunque nadie haya iniciado sesión;
 - usa la cuenta SYSTEM por defecto;
 - si la carpeta de origen está en otra máquina de la red, debe usar una cuenta de dominio
   (la contraseña se pide al aplicar y no se guarda).
 
 Alternativa: un trabajo del **Agente SQL Server**. Agregue un paso *CmdExec* que llame a
-`C:\SubirNube\subir_nube.bat`, por ejemplo al final del trabajo de respaldo. El archivo
+`C:\CaronteSync\carontesync.bat`, por ejemplo al final del trabajo de respaldo. El archivo
 `crear_job_sql.sql` crea uno, y sirve para SQL Server 2000 y 2005. El paso queda en rojo
 si algún archivo no se pudo subir.
+
+## Junto al reloj
+
+Al cerrar la ventana (o minimizarla), CaronteSync queda como un icono en el área de
+notificación, junto al reloj, igual que Dropbox:
+
+- **Clic** en el icono: abre la ventana.
+- **Clic derecho**: menú con *Abrir CaronteSync*, *Subir ahora*, *Detener la subida* y
+  *Salir*.
+- **Al pasar el ratón**: muestra el archivo que se está subiendo, el porcentaje y la
+  velocidad.
+- **El icono cambia** (una flecha verde) mientras hay una subida en curso.
+- **Al terminar una subida**, avisa con un globo: *Respaldos en la nube*, *Subida con
+  errores*, etc.
+
+*Salir* cierra la ventana y el icono, pero no corta una subida en curso: la subida la hace
+otro proceso, que sigue hasta terminar. Si abre CaronteSync estando ya junto al reloj,
+se muestra la ventana existente en lugar de abrir otra.
+
+Para que el icono aparezca al iniciar sesión, marque la opción en el instalador o en
+*Programación → Mostrar CaronteSync junto al reloj al iniciar sesión*. La subida
+programada no depende de esto: la hace el Programador de tareas aunque nadie inicie
+sesión.
 
 ## Uso diario
 
@@ -181,42 +227,43 @@ si algún archivo no se pudo subir.
 
 - **«No se pudo verificar el certificado»**:
   - revise que la fecha y la hora del servidor sean correctas;
-  - reemplace `C:\SubirNube\cacert.pem` por uno recién descargado de
-    <https://curl.se/ca/cacert.pem>, o reinstale una versión nueva de SubirNube.
+  - reemplace `C:\CaronteSync\cacert.pem` por uno recién descargado de
+    <https://curl.se/ca/cacert.pem>, o reinstale una versión nueva de CaronteSync.
 - **«La cuenta no está vinculada»** o **«no renovó el acceso»**: vuelva a vincular la
   cuenta. Con Google, si pasa cada 7 días, la app sigue en modo *Prueba*: publíquela.
 - **«La app de Dropbox no tiene el permiso…»**: marque `files.content.write` en
   *Permissions*, pulse *Submit* y vuelva a vincular la cuenta.
 - **Google responde `invalid_client`**: el ID de cliente no es del tipo *TVs y
   dispositivos de entrada limitada*.
-- **La tarea programada no corre**: en la pestaña *Programación*, el recuadro *Tarea en
-  Windows* indica si existe. Revise también la pestaña *Historial* y el registro
-  `C:\SubirNube\subir_nube.log`.
+- **La tarea programada no corre**: en *Programación*, el recuadro *Tarea en
+  Windows* indica si existe. Revise también *Historial* y el registro
+  `C:\CaronteSync\carontesync.log`.
 - **Errores de red repetidos**: si la red sale por un proxy, configúrelo en
   *Configuración → Avanzado*.
 
-## Archivos en C:\SubirNube
+## Archivos en C:\CaronteSync
 
 | Archivo | Contenido |
 |---|---|
-| `subir_nube_gui.pyw` | La ventana |
-| `subir_nube.py` | El motor que sube; también se usa desde la consola (ver abajo) |
-| `subir_nube.ini` | Configuración (la crea la ventana) |
+| `carontesync_gui.pyw` | La ventana |
+| `carontesync_bandeja.py` | El icono junto al reloj |
+| `carontesync.py` | El motor que sube; también se usa desde la consola (ver abajo) |
+| `carontesync.ini` | Configuración (la crea la ventana) |
 | `tokens.json` | Permiso de acceso a la cuenta en la nube |
 | `estado.json` | Archivos ya subidos y subidas a medias |
-| `historial.jsonl`, `subir_nube.log` | Historial y registro |
+| `historial.jsonl`, `carontesync.log` | Historial y registro |
 | `actividad.json` | Avance de la ejecución en curso (lo lee la ventana) |
 | `cacert.pem` | Certificados raíz para HTTPS |
-| `subir_nube.bat`, `crear_job_sql.sql` | Para usarlo desde el Agente SQL Server |
+| `carontesync.bat`, `crear_job_sql.sql` | Para usarlo desde el Agente SQL Server |
 
 ## Uso desde la consola
 
 ```
-C:\Python34\python.exe C:\SubirNube\subir_nube.py probar
-C:\Python34\python.exe C:\SubirNube\subir_nube.py subir
-C:\Python34\python.exe C:\SubirNube\subir_nube.py subir --simular
-C:\Python34\python.exe C:\SubirNube\subir_nube.py autorizar
-C:\Python34\python.exe C:\SubirNube\subir_nube.py programar
+C:\Python34\python.exe C:\CaronteSync\carontesync.py probar
+C:\Python34\python.exe C:\CaronteSync\carontesync.py subir
+C:\Python34\python.exe C:\CaronteSync\carontesync.py subir --simular
+C:\Python34\python.exe C:\CaronteSync\carontesync.py autorizar
+C:\Python34\python.exe C:\CaronteSync\carontesync.py programar
 ```
 
 | Código de salida | Significado |
@@ -255,5 +302,19 @@ Simulan:
 - subidas detenidas y reanudadas en otra ejecución;
 - sesiones de subida vencidas.
 
+`tests/test_windows.py` prueba lo que solo pasa en Windows Server. Esas pruebas se omiten
+en otros sistemas:
+- rutas de más de 260 caracteres, con espacios y acentos, y rutas de red (UNC);
+- un `.bak` bloqueado por otro programa, como SQL Server mientras lo escribe;
+- archivos de solo lectura;
+- `estado.json` abierto por otro proceso mientras se guarda;
+- el bloqueo entre dos procesos;
+- `pythonw.exe` sin consola;
+- el Programador de tareas;
+- el icono de la bandeja: menú, clic, segunda instancia y reinicio del Explorador.
+
 Las pruebas de la ventana necesitan tkinter. Todo se probó con el Python 3.4.4 oficial de
 Windows sobre Windows Server 2003 (emulado con Wine), y con Python 3.4.10 y 3.13 en Linux.
+
+Los iconos, el logo y las imágenes del instalador se generan con
+`python recursos/generar_imagenes.py`, que necesita Pillow.

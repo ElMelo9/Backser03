@@ -1,4 +1,4 @@
-﻿; Instalador de SubirNube para Windows Server 2003 / XP y versiones posteriores.
+﻿; Instalador de CaronteSync para Windows Server 2003 / XP y versiones posteriores.
 ;
 ; Se compila con Inno Setup 5.6.1, la última versión cuyos instaladores funcionan
 ; en Windows 2000/XP/2003. Antes de compilar deben estar en instalador\descargas\:
@@ -7,24 +7,26 @@
 ; Los scripts construir_instalador.bat (Windows) y construir_instalador.sh (Linux con
 ; Wine) los descargan y compilan este archivo.
 
-#define Version "2.0"
+#define Version "3.0"
 
 [Setup]
-AppId={{6E0F3B52-8A4C-4C1E-9B7D-2F1A5C3E8D10}
-AppName=SubirNube
+AppId={{9B3C7E21-5F4A-4D8E-A1C6-3E7B2D9F0C54}
+AppName=CaronteSync
 AppVersion={#Version}
-AppVerName=SubirNube {#Version}
-AppPublisher=SubirNube
-AppComments=Copia los respaldos de SQL Server a Dropbox o Google Drive
-DefaultDirName={sd}\SubirNube
-DefaultGroupName=SubirNube
+AppVerName=CaronteSync {#Version}
+AppPublisher=CaronteSync
+AppComments=Cruza los respaldos de SQL Server hacia Dropbox o Google Drive
+DefaultDirName={sd}\CaronteSync
+DefaultGroupName=CaronteSync
 DisableProgramGroupPage=yes
 DisableWelcomePage=no
 OutputDir=salida
-OutputBaseFilename=SubirNube-{#Version}-instalador
-SetupIconFile=..\subir_nube.ico
-UninstallDisplayIcon={app}\subir_nube.ico
-UninstallDisplayName=SubirNube {#Version}
+OutputBaseFilename=CaronteSync-{#Version}-instalador
+SetupIconFile=..\carontesync.ico
+WizardImageFile=asistente_grande.bmp
+WizardSmallImageFile=asistente_pequena.bmp
+UninstallDisplayIcon={app}\carontesync.ico
+UninstallDisplayName=CaronteSync {#Version}
 Compression=lzma2
 SolidCompression=yes
 PrivilegesRequired=admin
@@ -34,34 +36,42 @@ MinVersion=5.1
 Name: "es"; MessagesFile: "compiler:Languages\Spanish.isl"
 
 [Messages]
-es.WelcomeLabel2=Este programa instalará SubirNube {#Version}, que copia los respaldos de SQL Server (u otros archivos) a Dropbox o Google Drive.%n%nSi Python 3.4.4 no está instalado, se instalará también: es la última versión de Python que funciona en Windows Server 2003 y trae su propio TLS 1.2.
+es.WelcomeLabel2=Este programa instalará CaronteSync {#Version}.%n%nComo Caronte, el barquero que cruzaba las almas de un mundo a otro, CaronteSync cruza sus respaldos de SQL Server desde este servidor hacia la nube (Dropbox o Google Drive).%n%nSi Python 3.4.4 no está instalado, se instalará también: es la última versión de Python que funciona en Windows Server 2003 y trae su propio TLS 1.2.
 
 [Tasks]
 Name: "escritorio"; Description: "Crear un acceso directo en el escritorio"; GroupDescription: "Accesos directos:"
+Name: "inicio"; Description: "Mostrar CaronteSync junto al reloj al iniciar sesión (como Dropbox)"; GroupDescription: "Al iniciar Windows:"
 
 [Files]
 Source: "descargas\python-3.4.4.msi"; Flags: dontcopy
 Source: "descargas\cacert.pem"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\subir_nube.py"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\subir_nube_gui.pyw"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\subir_nube.bat"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\subir_nube.ico"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\subir_nube.ejemplo.ini"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\carontesync.py"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\carontesync_gui.pyw"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\carontesync_bandeja.py"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\carontesync.bat"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\carontesync.ico"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\carontesync_subiendo.ico"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\carontesync_logo.png"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\carontesync.ejemplo.ini"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\crear_job_sql.sql"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; DestName: "LEAME.txt"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\SubirNube"; Filename: "{code:Pythonw}"; Parameters: """{app}\subir_nube_gui.pyw"""; WorkingDir: "{app}"; IconFilename: "{app}\subir_nube.ico"; Comment: "Respaldos a la nube"
+Name: "{group}\CaronteSync"; Filename: "{code:Pythonw}"; Parameters: """{app}\carontesync_gui.pyw"""; WorkingDir: "{app}"; IconFilename: "{app}\carontesync.ico"; Comment: "Respaldos a la nube"
 Name: "{group}\Instrucciones"; Filename: "{app}\LEAME.txt"
-Name: "{group}\Desinstalar SubirNube"; Filename: "{uninstallexe}"
-Name: "{commondesktop}\SubirNube"; Filename: "{code:Pythonw}"; Parameters: """{app}\subir_nube_gui.pyw"""; WorkingDir: "{app}"; IconFilename: "{app}\subir_nube.ico"; Comment: "Respaldos a la nube"; Tasks: escritorio
+Name: "{group}\Desinstalar CaronteSync"; Filename: "{uninstallexe}"
+Name: "{commondesktop}\CaronteSync"; Filename: "{code:Pythonw}"; Parameters: """{app}\carontesync_gui.pyw"""; WorkingDir: "{app}"; IconFilename: "{app}\carontesync.ico"; Comment: "Respaldos a la nube"; Tasks: escritorio
+
+[Registry]
+; Al iniciar sesión, abre CaronteSync oculto junto al reloj (se puede cambiar en Programación).
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "CaronteSync"; ValueData: """{code:Pythonw}"" ""{app}\carontesync_gui.pyw"" --bandeja"; Flags: uninsdeletevalue; Tasks: inicio
 
 [Run]
-Filename: "{code:Pythonw}"; Parameters: """{app}\subir_nube_gui.pyw"""; WorkingDir: "{app}"; Description: "Abrir SubirNube"; Flags: postinstall nowait skipifsilent
+Filename: "{code:Pythonw}"; Parameters: """{app}\carontesync_gui.pyw"""; WorkingDir: "{app}"; Description: "Abrir CaronteSync"; Flags: postinstall nowait skipifsilent
 
 [UninstallRun]
 ; Quita la subida automática para que Windows no siga ejecutando un programa que ya no está.
-Filename: "{sys}\schtasks.exe"; Parameters: "/delete /tn SubirNube /f"; Flags: runhidden
+Filename: "{sys}\schtasks.exe"; Parameters: "/delete /tn CaronteSync /f"; Flags: runhidden
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\__pycache__"
@@ -128,7 +138,7 @@ begin
   if (CurUninstallStep = usPostUninstall) and not UninstallSilent then
     if MsgBox('¿Borrar también la configuración, el permiso de acceso a la cuenta en la nube, ' +
               'el historial y los registros?' + #13#10#13#10 +
-              'Si va a reinstalar SubirNube, responda No para conservarlos.',
+              'Si va a reinstalar CaronteSync, responda No para conservarlos.',
               mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
       DelTree(ExpandConstant('{app}'), True, True, True);
 end;

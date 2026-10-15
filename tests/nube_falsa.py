@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """Servidor HTTP local que imita las partes de Dropbox y Google Drive que usa
-subir_nube.py, con inyección de fallos para probar reintentos y reanudaciones."""
+carontesync.py, con inyección de fallos para probar reintentos y reanudaciones."""
 
 import hashlib
 import json

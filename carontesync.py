@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-subir_nube.py - Motor de SubirNube: copia los archivos de una carpeta local a
+carontesync.py - Motor de CaronteSync: copia los archivos de una carpeta local a
 una carpeta en Dropbox o Google Drive.
+
+Como Caronte, el barquero de la mitología griega que cruzaba las almas de un
+mundo a otro, CaronteSync cruza los respaldos desde el servidor hacia la nube.
 
 Pensado para Windows Server 2003 (por ejemplo, un servidor con SQL Server
 2000/2005 que deja sus respaldos .bak en disco). Windows 2003 no habla
@@ -10,15 +13,15 @@ ejecuta con Python 3.4.4 (la última versión con instalador para XP/2003),
 que trae su propio OpenSSL. Solo usa la librería estándar de Python y
 funciona igual con cualquier Python 3 más moderno.
 
-La ventana (subir_nube_gui.pyw) usa este módulo; también se puede usar solo:
-    python subir_nube.py autorizar        Vincula la cuenta de Dropbox o Google Drive.
-    python subir_nube.py probar           Comprueba la conexión y muestra la cuenta.
-    python subir_nube.py subir            Sube los archivos nuevos o modificados.
-    python subir_nube.py subir --simular  Muestra qué se subiría, sin subir nada.
-    python subir_nube.py programar        Crea o quita la tarea programada de Windows.
+La ventana (carontesync_gui.pyw) usa este módulo; también se puede usar solo:
+    python carontesync.py autorizar        Vincula la cuenta de Dropbox o Google Drive.
+    python carontesync.py probar           Comprueba la conexión y muestra la cuenta.
+    python carontesync.py subir            Sube los archivos nuevos o modificados.
+    python carontesync.py subir --simular  Muestra qué se subiría, sin subir nada.
+    python carontesync.py programar        Crea o quita la tarea programada de Windows.
 
 Opciones:
-    -c / --config RUTA   Archivo de configuración (por defecto, subir_nube.ini
+    -c / --config RUTA   Archivo de configuración (por defecto, carontesync.ini
                          en la misma carpeta que este script).
     -v / --detallado     Registra también los mensajes de depuración.
 
@@ -41,18 +44,22 @@ import logging
 import logging.handlers
 import os
 import re
+import socket
 import ssl
+import stat
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 
-VERSION = "2.0"
+VERSION = "3.0"
 MB = 1024 * 1024
-NOMBRE_TAREA = "SubirNube"
+NOMBRE_TAREA = "CaronteSync"
 TROZO_ENVIO = 256 * 1024    # cada bloque se envía en trozos para informar el avance
+BUFER_SOCKET = 4 * MB       # búferes TCP: ver crear_conexion_rapida()
 
-log = logging.getLogger("subir_nube")
+log = logging.getLogger("carontesync")
 
 # Las pruebas lo reemplazan para no esperar de verdad entre reintentos.
 _dormir = time.sleep
@@ -150,11 +157,50 @@ def borrar_si_existe(ruta):
 
 
 def escribir_json(ruta, datos):
-    """Escribe en un temporal y lo renombra, para no dejar el archivo a medias."""
+    """Escribe en un temporal y lo renombra, para no dejar el archivo a medias.
+    En Windows el renombrado falla mientras otro proceso (la ventana leyendo, un
+    antivirus revisando) tiene el archivo abierto: se reintenta un momento."""
     temporal = ruta + ".tmp"
     with open(temporal, "w", encoding="utf-8") as f:
         json.dump(datos, f, indent=1, sort_keys=True, ensure_ascii=False)
-    os.replace(temporal, ruta)
+    for intento in range(20):
+        try:
+            os.replace(temporal, ruta)
+            return
+        except PermissionError:
+            if intento == 19:
+                raise
+            time.sleep(0.05)
+
+
+def ruta_extendida(ruta):
+    """En Windows, ruta con el prefijo de rutas largas ("\\\\?\\") para poder usar más de 260 caracteres
+    (respaldos dentro de muchas subcarpetas). En otros sistemas, la misma ruta."""
+    if os.name != "nt" or not ruta or ruta.startswith("\\\\?\\"):
+        return ruta
+    ruta = os.path.abspath(ruta)
+    if ruta.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + ruta[2:]
+    return "\\\\?\\" + ruta
+
+
+def clave_ruta(ruta):
+    """Forma comparable de una ruta: absoluta, sin el prefijo de rutas largas y, en Windows,
+    sin distinguir mayúsculas."""
+    if ruta.startswith("\\\\?\\UNC\\"):
+        ruta = "\\\\" + ruta[8:]
+    elif ruta.startswith("\\\\?\\"):
+        ruta = ruta[4:]
+    return os.path.normcase(os.path.abspath(ruta))
+
+
+def borrar_archivo(ruta):
+    """Borra un archivo, quitándole antes el atributo de solo lectura si hace falta."""
+    try:
+        os.remove(ruta)
+    except PermissionError:
+        os.chmod(ruta, stat.S_IWRITE)
+        os.remove(ruta)
 
 
 def leer_json(ruta):
@@ -190,13 +236,14 @@ CAMPOS_CONFIG = (
      "No sube archivos modificados hace menos de estos minutos: SQL Server podría estar escribiéndolos."),
     ("general", "borrar_local_tras_subir", "no",
      "si = borra el archivo local después de subirlo y verificar su suma en la nube."),
-    ("general", "tamano_bloque_mb", "16", "Tamaño de cada bloque enviado (1-128 MB)."),
+    ("general", "tamano_bloque_mb", "32",
+     "Tamaño de cada bloque enviado (1-128 MB). Más grande = menos pausas entre bloques, pero más memoria."),
     ("general", "reintentos", "5", "Reintentos ante cortes de red o errores temporales del servicio."),
     ("general", "timeout_segundos", "120", "Tiempo máximo de espera de cada petición."),
     ("general", "certificados", "cacert.pem",
      "Certificados raíz para HTTPS (los de Windows 2003 están desactualizados). Vacío = los de Windows."),
     ("general", "proxy", "", "Proxy de salida, si hace falta: host:puerto  o  http://usuario:clave@host:puerto"),
-    ("general", "archivo_log", "subir_nube.log", ""),
+    ("general", "archivo_log", "carontesync.log", ""),
     ("general", "archivo_estado", "estado.json", ""),
     ("general", "archivo_tokens", "tokens.json", "Aquí se guarda el permiso de acceso a la cuenta: protéjalo."),
     ("dropbox", "app_key", "", "De https://www.dropbox.com/developers/apps (pestaña Settings de su app)."),
@@ -217,6 +264,9 @@ CAMPOS_CONFIG = (
 def leer_texto(ruta):
     with open(ruta, "rb") as f:
         crudo = f.read()
+    if crudo.startswith((b"\xff\xfe", b"\xfe\xff")):
+        # "Unicode" en el Bloc de notas: UTF-16 con marca de orden de bytes.
+        return crudo.decode("utf-16")
     try:
         return crudo.decode("utf-8-sig")
     except UnicodeDecodeError:
@@ -242,7 +292,7 @@ def leer_valores(ruta):
 
 def texto_configuracion(valores):
     """Contenido completo del .ini, con un comentario para cada parámetro."""
-    lineas = ["; Configuración de SubirNube. Se edita desde la ventana del programa,",
+    lineas = ["; Configuración de CaronteSync. Se edita desde la ventana del programa,",
               "; o a mano con el Bloc de notas (los comentarios van en su propia línea)."]
     seccion_actual = None
     for seccion, clave, defecto, comentario in CAMPOS_CONFIG:
@@ -275,14 +325,14 @@ def guardar_configuracion(ruta, valores):
 
 
 class Configuracion(object):
-    """Lee subir_nube.ini. Las rutas relativas se toman desde la carpeta del .ini,
+    """Lee carontesync.ini. Las rutas relativas se toman desde la carpeta del .ini,
     porque el Programador de tareas y el Agente SQL arrancan en otra carpeta."""
 
     def __init__(self, ruta):
         self.ruta = os.path.abspath(ruta)
         if not os.path.isfile(self.ruta):
             raise ErrorFatal("No existe el archivo de configuración {0}. Configure el programa desde su "
-                             "ventana o copie subir_nube.ejemplo.ini como subir_nube.ini.".format(self.ruta))
+                             "ventana o copie carontesync.ejemplo.ini como carontesync.ini.".format(self.ruta))
         self.base = os.path.dirname(self.ruta)
         self._ini = configparser.ConfigParser(interpolation=None)
         try:
@@ -304,12 +354,12 @@ class Configuracion(object):
         self.recursivo = self._booleano("general", "recursivo", False)
         self.antiguedad_minima = self._entero("general", "antiguedad_minima_minutos", 10, 0, 100000) * 60
         self.borrar_local = self._booleano("general", "borrar_local_tras_subir", False)
-        self.tamano_bloque = self._entero("general", "tamano_bloque_mb", 16, 1, 128) * MB
+        self.tamano_bloque = self._entero("general", "tamano_bloque_mb", 32, 1, 128) * MB
         self.reintentos = self._entero("general", "reintentos", 5, 0, 50)
         self.timeout = self._entero("general", "timeout_segundos", 120, 10, 3600)
         self.certificados = self._ruta("general", "certificados", "cacert.pem")
         self.proxy = self._texto("general", "proxy", "")
-        self.archivo_log = self._ruta("general", "archivo_log", "subir_nube.log")
+        self.archivo_log = self._ruta("general", "archivo_log", "carontesync.log")
         self.archivo_estado = self._ruta("general", "archivo_estado", "estado.json")
         self.archivo_tokens = self._ruta("general", "archivo_tokens", "tokens.json")
         # Archivos que comparten el motor y la ventana.
@@ -323,7 +373,7 @@ class Configuracion(object):
             raise ErrorFatal(
                 "No se encuentra el archivo de certificados {0}. Descárguelo desde "
                 "https://curl.se/ca/cacert.pem (en un equipo moderno) y cópielo junto a "
-                "subir_nube.py, o deje 'certificados' vacío para usar los del sistema."
+                "carontesync.py, o deje 'certificados' vacío para usar los del sistema."
                 .format(self.certificados))
         self.programacion = self._programacion()
 
@@ -396,7 +446,7 @@ class Configuracion(object):
         if self.archivo_log:
             rutas.append(self.archivo_log)
             rutas.extend("{0}.{1}".format(self.archivo_log, i) for i in range(1, 10))
-        return set(os.path.normcase(os.path.abspath(r)) for r in rutas if r)
+        return set(clave_ruta(r) for r in rutas if r)
 
 
 # ---------------------------------------------------------------------------
@@ -406,7 +456,7 @@ class Configuracion(object):
 MENSAJE_CERTIFICADO = (
     "No se pudo verificar el certificado de {host} ({error}). Compruebe que la fecha y hora "
     "del servidor sean correctas y descargue un cacert.pem actualizado desde "
-    "https://curl.se/ca/cacert.pem (en un equipo moderno); cópielo junto a subir_nube.py.")
+    "https://curl.se/ca/cacert.pem (en un equipo moderno); cópielo junto a carontesync.py.")
 
 
 def analizar_proxy(texto):
@@ -434,6 +484,35 @@ def es_error_certificado(e):
     if isinstance(e, ssl.CertificateError):
         return True
     return isinstance(e, ssl.SSLError) and "CERTIFICATE_VERIFY_FAILED" in str(e)
+
+
+def crear_conexion_rapida(direccion, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None):
+    """Como socket.create_connection, pero pide búferes TCP grandes *antes* de conectar.
+    En Windows XP/2003 el búfer de envío por defecto es de 8 KB, lo que frena la subida
+    cuando el servidor está lejos, y un búfer de recepción mayor de 64 KB es lo que hace
+    que Windows pida la escala de ventana TCP (RFC 1323) al conectar."""
+    host, puerto = direccion
+    ultimo_error = None
+    for familia, tipo, protocolo, _, destino in socket.getaddrinfo(host, puerto, 0, socket.SOCK_STREAM):
+        conexion = None
+        try:
+            conexion = socket.socket(familia, tipo, protocolo)
+            for opcion in (socket.SO_SNDBUF, socket.SO_RCVBUF):
+                try:
+                    conexion.setsockopt(socket.SOL_SOCKET, opcion, BUFER_SOCKET)
+                except OSError:
+                    pass
+            if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+                conexion.settimeout(timeout)
+            if source_address:
+                conexion.bind(source_address)
+            conexion.connect(destino)
+            return conexion
+        except OSError as e:
+            ultimo_error = e
+            if conexion is not None:
+                conexion.close()
+    raise ultimo_error or OSError("no se encontró la dirección de {0}".format(host))
 
 
 def crear_contexto_ssl(certificados):
@@ -497,6 +576,7 @@ class ClienteHttp(object):
                 conexion = http.client.HTTPConnection(destino, destino_puerto, timeout=self.timeout)
             if self.proxy:
                 conexion.set_tunnel(host, puerto, headers=self.proxy[2])
+            conexion._create_connection = crear_conexion_rapida
             self._conexiones[clave] = conexion
         return clave, conexion
 
@@ -517,7 +597,7 @@ class ClienteHttp(object):
         ruta = partes.path or "/"
         if partes.query:
             ruta += "?" + partes.query
-        cab = {"User-Agent": "subir_nube/" + VERSION}
+        cab = {"User-Agent": "CaronteSync/" + VERSION}
         cab.update(cabeceras or {})
         if cuerpo is None and metodo != "GET":
             cuerpo = b""
@@ -615,50 +695,112 @@ class HashDropbox(object):
 
 
 class LectorArchivo(object):
-    """Lee un archivo por bloques en cualquier posición y va calculando su suma
-    de verificación en orden. Si hay que saltar hacia adelante (al reanudar una
-    subida), lee la parte intermedia solo para la suma."""
+    """Prepara los bloques a enviar. Un hilo recorre el archivo en orden, calcula su
+    suma de verificación y deja listo el bloque siguiente mientras la red envía el
+    actual: así el disco, la suma y la red trabajan a la vez (hashlib y la lectura de
+    disco liberan el GIL de Python). Si hay que enviar otra posición (reanudar, o el
+    servicio pide repetir un trozo), se lee directamente y la suma no se altera,
+    porque siempre se calcula sobre el archivo completo y en orden."""
 
-    def __init__(self, ruta, crear_hash, latido=None):
+    ADELANTO = 1   # bloques preparados por adelantado (memoria: ADELANTO x bloque)
+
+    def __init__(self, ruta, crear_hash, tamano, bloque, latido=None):
+        self.ruta = ruta
         self.hash = crear_hash()
-        self.hasta = 0          # bytes ya incluidos en la suma
+        self.tamano = tamano
+        self.bloque = max(1, bloque)
         self.latido = latido
-        self.archivo = open(ruta, "rb")
+        self._directo = open(ruta_extendida(ruta), "rb")
+        self._condicion = threading.Condition()
+        self._listos = {}      # posición -> datos leídos por adelantado
+        self._pedido = 0       # próxima posición que necesita el envío
+        self._sumado = 0       # bytes ya incluidos en la suma
+        self._error = None
+        self._cerrado = False
+        self._hilo = threading.Thread(target=self._recorrer, name="CaronteSync-lector")
+        self._hilo.daemon = True
+        self._hilo.start()
 
     def __enter__(self):
         return self
 
     def __exit__(self, *_):
-        self.archivo.close()
+        self.cerrar()
 
-    def _ponerse_al_dia(self, posicion):
-        if posicion - self.hasta > 64 * MB:
-            log.info("  Calculando la suma de la parte ya subida (%s)...", legible(posicion - self.hasta))
-        self.archivo.seek(self.hasta)
-        while self.hasta < posicion:
-            datos = self.archivo.read(min(8 * MB, posicion - self.hasta))
-            if not datos:
-                raise ErrorNube("el archivo se acortó mientras se subía; se volverá a intentar en la próxima ejecución")
-            self.hash.update(datos)
-            self.hasta += len(datos)
-            if self.latido is not None:
-                self.latido()
+    def cerrar(self):
+        with self._condicion:
+            self._cerrado = True
+            self._listos.clear()
+            self._condicion.notify_all()
+        self._hilo.join(10)
+        self._directo.close()
+
+    def _recorrer(self):
+        try:
+            with open(ruta_extendida(self.ruta), "rb") as archivo:
+                posicion = 0
+                while posicion < self.tamano:
+                    with self._condicion:
+                        while (not self._cerrado and posicion >= self._pedido
+                               and len(self._listos) >= self.ADELANTO):
+                            self._condicion.wait()
+                        if self._cerrado:
+                            return
+                    cantidad = min(self.bloque, self.tamano - posicion)
+                    datos = archivo.read(cantidad)
+                    if len(datos) != cantidad:
+                        raise ErrorNube("el archivo se acortó mientras se subía; se volverá a intentar "
+                                        "en la próxima ejecución")
+                    self.hash.update(datos)
+                    with self._condicion:
+                        self._sumado = posicion + cantidad
+                        if posicion >= self._pedido:
+                            self._listos[posicion] = datos
+                        self._condicion.notify_all()
+                    posicion += cantidad
+        except Exception as e:     # se informa al hilo que envía
+            with self._condicion:
+                self._error = e
+                self._condicion.notify_all()
+
+    def _esperar(self):
+        self._condicion.wait(1.0)
+        if self.latido is not None:
+            self.latido()
 
     def leer(self, posicion, cantidad):
-        if posicion > self.hasta:
-            self._ponerse_al_dia(posicion)
-        self.archivo.seek(posicion)
-        datos = self.archivo.read(cantidad)
+        with self._condicion:
+            self._pedido = posicion
+            for vieja in [p for p in self._listos if p < posicion]:
+                del self._listos[vieja]
+            self._condicion.notify_all()
+            while True:
+                datos = self._listos.pop(posicion, None)
+                if datos is not None:
+                    self._condicion.notify_all()
+                    if len(datos) == cantidad:
+                        return datos
+                    break
+                if (self._error is not None or self._sumado > posicion or posicion % self.bloque
+                        or posicion >= self.tamano or not self._hilo.is_alive()):
+                    break        # ese bloque no llegará por el hilo: se lee directamente
+                self._esperar()      # el hilo todavía no llegó a este bloque
+        self._directo.seek(posicion)
+        datos = self._directo.read(cantidad)
         if len(datos) != cantidad:
             raise ErrorNube("el archivo se acortó mientras se subía; se volverá a intentar en la próxima ejecución")
-        if posicion + len(datos) > self.hasta:
-            self.hash.update(memoryview(datos)[self.hasta - posicion:])
-            self.hasta = posicion + len(datos)
         return datos
 
-    def hash_hex(self, tamano):
-        if self.hasta < tamano:
-            self._ponerse_al_dia(tamano)
+    def hash_hex(self):
+        """Suma de verificación del archivo completo (espera a que el hilo termine)."""
+        with self._condicion:
+            self._pedido = self.tamano
+            self._listos.clear()
+            self._condicion.notify_all()
+            while self._sumado < self.tamano and self._error is None:
+                self._esperar()
+            if self._error is not None:
+                raise self._error
         return self.hash.hexdigest()
 
 
@@ -932,7 +1074,7 @@ class Proveedor(object):
             refresh = self.tokens.obtener(self.nombre)
             if not refresh:
                 raise ErrorFatal("La cuenta de {0} no está vinculada. Use 'Vincular cuenta' en la ventana o "
-                                 "ejecute: python subir_nube.py autorizar".format(self.titulo))
+                                 "ejecute: python carontesync.py autorizar".format(self.titulo))
             r = self._pedir_token(refresh)
             self._comprobar_respuesta(r)
             datos = r.json()
@@ -1064,7 +1206,7 @@ class Dropbox(Proveedor):
         commit = {"path": destino, "mode": "overwrite", "autorename": False, "mute": True,
                   "client_modified": fecha_iso(mtime)}
         descripcion = "Subiendo " + relativa
-        with LectorArchivo(ruta_local, HashDropbox, self.monitor.latido) as lector:
+        with LectorArchivo(ruta_local, HashDropbox, tamano, self.conf.tamano_bloque, self.monitor.latido) as lector:
             if tamano <= self.conf.tamano_bloque:
                 datos = lector.leer(0, tamano)
                 r = self._reintentar(lambda: self._subir_contenido("files/upload", commit, datos, 0), descripcion)
@@ -1072,7 +1214,7 @@ class Dropbox(Proveedor):
             else:
                 meta = self._subir_por_sesion(lector, tamano, commit, relativa, reanudacion)
             self.monitor.fase("Verificando")
-            hash_local = lector.hash_hex(tamano)
+            hash_local = lector.hash_hex()
         reanudacion.borrar()
         return {"tamano": meta.get("size"), "hash_remoto": meta.get("content_hash"), "hash_local": hash_local}
 
@@ -1296,7 +1438,7 @@ class GoogleDrive(Proveedor):
         reanudacion = reanudacion or SinReanudacion()
         descripcion = "Subiendo " + relativa
         previa = reanudacion.datos if reanudacion.datos and reanudacion.datos.get("proveedor") == self.nombre else None
-        with LectorArchivo(ruta_local, hashlib.md5, self.monitor.latido) as lector:
+        with LectorArchivo(ruta_local, hashlib.md5, tamano, self.conf.tamano_bloque, self.monitor.latido) as lector:
             meta = None
             if previa:
                 log.info("  Se reanuda la subida pendiente de %s.", relativa)
@@ -1317,7 +1459,7 @@ class GoogleDrive(Proveedor):
                     raise ErrorNube(descripcion + ": la sesión de subida expiró; se volverá a intentar "
                                     "en la próxima ejecución.")
             self.monitor.fase("Verificando")
-            hash_local = lector.hash_hex(tamano)
+            hash_local = lector.hash_hex()
         reanudacion.borrar()
         if meta.get("id") and (meta.get("size") is None or not meta.get("md5Checksum")):
             url = self.URL_API + "/files/" + meta["id"] + "?fields=" + self.CAMPOS
@@ -1538,7 +1680,8 @@ def buscar_archivos(conf):
     def al_fallar(error):
         log.warning("No se pudo leer la carpeta %s: %s", error.filename, error.strerror)
 
-    for raiz, carpetas, archivos in os.walk(conf.origen, onerror=al_fallar):
+    origen = ruta_extendida(conf.origen)
+    for raiz, carpetas, archivos in os.walk(origen, onerror=al_fallar):
         if conf.recursivo:
             carpetas.sort()
         else:
@@ -1547,9 +1690,9 @@ def buscar_archivos(conf):
             if not coincide(nombre, conf.patrones):
                 continue
             ruta = os.path.join(raiz, nombre)
-            if os.path.normcase(os.path.abspath(ruta)) in propios:
+            if clave_ruta(ruta) in propios:
                 continue
-            relativa = os.path.relpath(ruta, conf.origen).replace(os.sep, "/")
+            relativa = os.path.relpath(ruta, origen).replace(os.sep, "/")
             encontrados.append((ruta, relativa))
     return encontrados
 
@@ -1668,7 +1811,7 @@ def ejecutar_subida(conf, proveedor, simular=False, actividad=None, historial=No
                 log.warning("No se borra %s: no se pudo verificar la suma en la nube.", relativa)
             else:
                 try:
-                    os.remove(ruta)
+                    borrar_archivo(ruta)
                 except OSError as e:
                     log.warning("No se pudo borrar el archivo local %s: %s", relativa, e)
                 else:
@@ -1751,6 +1894,9 @@ class Programacion(object):
         return texto + ", con la cuenta {0}.".format(self.usuario or "SYSTEM")
 
 
+LIMITE_COMANDO_TAREA = 261    # /tr de schtasks admite como máximo 261 caracteres
+
+
 def es_windows_antiguo():
     """XP/2003: schtasks usa otro formato de hora y no tiene /f ni /query /tn."""
     return os.name == "nt" and sys.getwindowsversion().major < 6
@@ -1827,7 +1973,12 @@ def aplicar_programacion(programacion, ruta_config, clave=None):
         return "Se quitó la subida automática."
     if programacion.usuario and not clave:
         raise ErrorFatal("Falta la contraseña de la cuenta {0}.".format(programacion.usuario))
-    argumentos = argumentos_crear_tarea(programacion, comando_tarea(ruta_config), es_windows_antiguo(), clave)
+    comando = comando_tarea(ruta_config)
+    if len(comando) > LIMITE_COMANDO_TAREA:
+        raise ErrorFatal("La ruta de instalación es demasiado larga para una tarea programada de Windows "
+                         "({0} caracteres; el máximo es {1}). Instale CaronteSync en una carpeta más corta, "
+                         "por ejemplo C:\\CaronteSync.".format(len(comando), LIMITE_COMANDO_TAREA))
+    argumentos = argumentos_crear_tarea(programacion, comando, es_windows_antiguo(), clave)
     codigo, salida = ejecutar_schtasks(argumentos)
     if codigo != 0:
         raise ErrorFatal("Windows no pudo crear la tarea programada: " + (salida or "código {0}".format(codigo)))
@@ -1869,17 +2020,17 @@ def agregar_archivo_registro(ruta):
 
 
 def ruta_config_predeterminada():
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "subir_nube.ini")
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "carontesync.ini")
 
 
 def main(argv=None):
     analizador = argparse.ArgumentParser(
-        prog="subir_nube.py", description="Copia los archivos de una carpeta local a Dropbox o Google Drive.")
+        prog="carontesync.py", description="Copia los archivos de una carpeta local a Dropbox o Google Drive.")
     analizador.add_argument("accion", nargs="?", default="subir",
                             choices=("subir", "autorizar", "probar", "programar"),
                             help="subir (por defecto), autorizar la cuenta, probar la conexión o programar la tarea")
     analizador.add_argument("-c", "--config", default=ruta_config_predeterminada(),
-                            help="archivo de configuración (por defecto subir_nube.ini junto al script)")
+                            help="archivo de configuración (por defecto carontesync.ini junto al script)")
     analizador.add_argument("--simular", action="store_true", help="muestra qué se subiría, sin subir nada")
     analizador.add_argument("-v", "--detallado", action="store_true", help="registra también la depuración")
     analizador.add_argument("--origen", default="consola", choices=("consola", "manual", "programada"),
@@ -1891,7 +2042,7 @@ def main(argv=None):
     try:
         conf = Configuracion(args.config)
         agregar_archivo_registro(conf.archivo_log)
-        log.debug("subir_nube %s, Python %s, %s", VERSION, sys.version.split()[0], ssl.OPENSSL_VERSION)
+        log.debug("carontesync %s, Python %s, %s", VERSION, sys.version.split()[0], ssl.OPENSSL_VERSION)
         if args.accion == "programar":
             clave = None
             if conf.programacion.activa and conf.programacion.usuario:

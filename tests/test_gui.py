@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Pruebas de la ventana (subir_nube_gui.pyw). Necesitan tkinter y una pantalla;
+"""Pruebas de la ventana (carontesync_gui.pyw). Necesitan tkinter y una pantalla;
 si no las hay, se omiten."""
 
 import importlib.machinery
@@ -15,14 +15,14 @@ from unittest import mock
 RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, RAIZ)
 
-import subir_nube as sn  # noqa: E402
+import carontesync as sn  # noqa: E402
 
 try:
     import tkinter
     _raiz = tkinter.Tk()
     _raiz.destroy()
-    gui = importlib.machinery.SourceFileLoader("subir_nube_gui",
-                                               os.path.join(RAIZ, "subir_nube_gui.pyw")).load_module()
+    gui = importlib.machinery.SourceFileLoader("carontesync_gui",
+                                               os.path.join(RAIZ, "carontesync_gui.pyw")).load_module()
     MOTIVO = None
 except Exception as e:      # sin tkinter o sin pantalla
     gui = None
@@ -32,14 +32,13 @@ except Exception as e:      # sin tkinter o sin pantalla
 @unittest.skipIf(gui is None, MOTIVO)
 class PruebasVentana(unittest.TestCase):
     def setUp(self):
-        self.dir = tempfile.mkdtemp(prefix="subir_nube_gui_")
+        self.dir = tempfile.mkdtemp(prefix="carontesync_gui_")
         self.addCleanup(shutil.rmtree, self.dir, True)
-        self.ini = os.path.join(self.dir, "subir_nube.ini")
+        self.ini = os.path.join(self.dir, "carontesync.ini")
         open(os.path.join(self.dir, "cacert.pem"), "w").close()
         self.raiz = tkinter.Tk()
-        self.addCleanup(self.raiz.destroy)
         self.app = gui.Aplicacion(self.raiz, self.ini)
-        self.addCleanup(self.app.detener_temporizadores)
+        self.addCleanup(self.app.salir)      # también quita el icono de la bandeja
         self.raiz.update()
 
     def test_formulario_nuevo_se_guarda_y_valida(self):
@@ -89,8 +88,11 @@ class PruebasVentana(unittest.TestCase):
                                 "resultado": "correcta", "subidos": 1, "bytes": GB, "detalle": "ok"}) + "\n")
         self.app._mostrar_actividad()
         self.app.cargar_historial(True)
-        self.assertIn("20.0 %", self.app.lbl_cantidad.cget("text"))
-        self.assertIn("tiempo restante: 1 h 42 min", self.app.lbl_tiempo.cget("text"))
+        self.assertEqual(self.app.lbl_porcentaje.cget("text"), "20.0 %")
+        self.assertEqual(self.app.lbl_cantidad.cget("text"), "3.0 GB de 15.0 GB")
+        self.assertEqual(self.app.lbl_velocidad.cget("text"), "2.0 MB/s")
+        self.assertEqual(self.app.lbl_restante.cget("text"), "1 h 42 min")
+        self.assertEqual(self.app.lbl_lateral.cget("text"), "Subiendo 20 %")
         self.assertEqual(str(self.app.btn_subir.cget("state")), "disabled")
         self.assertEqual(str(self.app.btn_detener.cget("state")), "normal")
         self.assertEqual(len(self.app.arbol_archivos.get_children()), 1)
@@ -111,7 +113,7 @@ class PruebasVentana(unittest.TestCase):
         with mock.patch.object(gui.subprocess, "Popen") as popen:
             self.app.subir_ahora()
         argumentos = popen.call_args[0][0]
-        self.assertEqual(argumentos[1:], [os.path.join(gui.CARPETA, "subir_nube.py"), "subir", "-c",
+        self.assertEqual(argumentos[1:], [os.path.join(gui.CARPETA, "carontesync.py"), "subir", "-c",
                                           os.path.abspath(self.ini), "--origen", "manual"])
         self.assertTrue(argumentos[0].lower().endswith(("pythonw.exe", "python.exe", "python", "python3")))
 
@@ -123,6 +125,68 @@ class PruebasVentana(unittest.TestCase):
             self.app.subir_ahora()
         self.assertFalse(popen.called)
         self.assertIn("vincule la cuenta", error.call_args[0][1])
+
+    def escribir_actividad(self, **datos):
+        base = {"activo": True, "actualizado": time.time(), "inicio": time.time() - 60, "origen": "programada",
+                "fase": "Subiendo", "archivo": "base.bak", "indice": 1, "cantidad": 1, "archivo_hecho": 50,
+                "archivo_total": 100, "lote_hecho": 50, "lote_total": 100, "velocidad": 1024.0}
+        base.update(datos)
+        sn.escribir_json(os.path.join(self.dir, "actividad.json"), base)
+
+    def test_navegacion_lateral(self):
+        for clave in ("configuracion", "programacion", "historial", "estado"):
+            self.app.mostrar_pagina(clave)
+            self.raiz.update()
+            self.assertEqual(self.app.pagina_actual, clave)
+            visibles = [n for n, marco in self.app.paginas.items() if marco.winfo_manager()]
+            self.assertEqual(visibles, [clave])
+
+    def test_sin_subida_detener_desactivado(self):
+        self.app._mostrar_actividad()
+        self.assertEqual(str(self.app.btn_detener.cget("state")), "disabled")
+        self.assertEqual(self.app.lbl_lateral.cget("text"), "En espera")
+
+    @unittest.skipUnless(gui.bandeja is not None if gui else False, "solo en Windows")
+    def test_cerrar_deja_el_icono_junto_al_reloj(self):
+        self.assertIsNotNone(self.app.icono_bandeja)
+        with mock.patch.object(self.app.icono_bandeja, "aviso") as aviso:
+            self.app.cerrar()
+            self.raiz.update()
+        self.assertEqual(self.raiz.state(), "withdrawn")
+        self.assertIn("sigue", aviso.call_args[0][0])
+        self.app.mostrar()
+        self.raiz.update()
+        self.assertEqual(self.raiz.state(), "normal")
+
+    @unittest.skipUnless(gui.bandeja is not None if gui else False, "solo en Windows")
+    def test_bandeja_muestra_el_avance_y_avisa_al_terminar(self):
+        icono = self.app.icono_bandeja
+        self.escribir_actividad()
+        self.app._mostrar_actividad()
+        self.assertIn("subiendo base.bak (50 %", icono.descripcion)
+        self.assertEqual(icono.hicon, icono._icono(gui.ICONO_SUBIENDO))
+        self.escribir_actividad(activo=False, resultado="correcta", detalle="Resumen: 1 subidos.",
+                                fin=time.time())
+        with mock.patch.object(icono, "aviso") as aviso:
+            self.app._mostrar_actividad()
+        self.assertEqual(aviso.call_args[0][0], "Respaldos en la nube")
+        self.assertIn("última subida correcta", icono.descripcion)
+        self.assertEqual(icono.hicon, icono._icono(gui.ICONO))
+        # El menú de la bandeja: "Detener" solo se habilita durante una subida.
+        nombres = [e[0] for e in icono.elementos if e]
+        self.assertEqual(nombres, ["Abrir CaronteSync", "Subir ahora", "Detener la subida", "Salir"])
+        self.assertFalse(icono.elementos[2][2]())
+
+    @unittest.skipUnless(os.name == "nt", "solo en Windows")
+    def test_inicio_con_windows(self):
+        anterior = gui.inicio_con_windows()
+        self.addCleanup(gui.cambiar_inicio_con_windows, anterior)
+        gui.cambiar_inicio_con_windows(True)
+        self.assertTrue(gui.inicio_con_windows())
+        self.app.cargar_formulario()
+        self.assertTrue(self.app.var_inicio.get())
+        gui.cambiar_inicio_con_windows(False)
+        self.assertFalse(gui.inicio_con_windows())
 
 
 if __name__ == "__main__":
